@@ -819,9 +819,9 @@ if st.session_state.session_items:
                     # Note: comparison_display_df has blank rows as NaN/empty strings
                     
                     # Helper to get numeric price
-                    def get_price(row):
+                    def get_final_price(row):
                         try:
-                            return float(row['Price'])
+                            return float(row['Final Price'])
                         except:
                             return float('inf')
 
@@ -835,7 +835,7 @@ if st.session_state.session_items:
                         if is_blank:
                             if group_rows:
                                 # Find min price in group
-                                min_row = min(group_rows, key=get_price)
+                                min_row = min(group_rows, key=get_final_price)
                                 summary_rows.append(min_row)
                                 group_rows = []
                         else:
@@ -843,7 +843,7 @@ if st.session_state.session_items:
                     
                     # Process last group
                     if group_rows:
-                        min_row = min(group_rows, key=get_price)
+                        min_row = min(group_rows, key=get_final_price)
                         summary_rows.append(min_row)
                     
                     if summary_rows:
@@ -961,18 +961,14 @@ if st.session_state.session_items:
                         if is_blank:
                             # End of a group - process it
                             if group_rows:
-                                # Find min price in this group
-                                prices = [(r, export_df.iloc[r-2]['Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Price'])]
+                                # Find min price in this group (USING FINAL PRICE)
+                                prices = [(r, export_df.iloc[r-2]['Final Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Final Price'])]
                                 if prices:
                                     min_row = min(prices, key=lambda x: x[1])[0]
                                     
-                                    # Highlight Price column
-                                    price_col_idx = list(export_df.columns).index('Price')
-                                    worksheet.cell(row=min_row, column=price_col_idx + 1).fill = green_fill
-                                    
-                                    # Highlight Final Price column
-                                    final_price_col_idx = list(export_df.columns).index('Final Price')
-                                    worksheet.cell(row=min_row, column=final_price_col_idx + 1).fill = green_fill
+                                    # Highlight ENTIRE ROW
+                                    for col_idx in range(1, len(export_df.columns) + 1):
+                                        worksheet.cell(row=min_row, column=col_idx).fill = green_fill
                                     
                                 group_rows = []
                         else:
@@ -981,17 +977,13 @@ if st.session_state.session_items:
                     
                     # Process last group if exists
                     if group_rows:
-                        prices = [(r, export_df.iloc[r-2]['Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Price'])]
+                        prices = [(r, export_df.iloc[r-2]['Final Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Final Price'])]
                         if prices:
                             min_row = min(prices, key=lambda x: x[1])[0]
                             
-                            # Highlight Price column
-                            price_col_idx = list(export_df.columns).index('Price')
-                            worksheet.cell(row=min_row, column=price_col_idx + 1).fill = green_fill
-                            
-                            # Highlight Final Price column
-                            final_price_col_idx = list(export_df.columns).index('Final Price')
-                            worksheet.cell(row=min_row, column=final_price_col_idx + 1).fill = green_fill
+                            # Highlight ENTIRE ROW
+                            for col_idx in range(1, len(export_df.columns) + 1):
+                                worksheet.cell(row=min_row, column=col_idx).fill = green_fill
                     
                     # Auto-size columns
                     for idx, col in enumerate(export_df.columns):
