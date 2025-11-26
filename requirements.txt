@@ -1,0 +1,6 @@
+
+pypdf
+google-generativeai
+openpyxl
+streamlit
+pandas
