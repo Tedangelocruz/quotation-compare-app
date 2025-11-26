@@ -133,14 +133,25 @@ def parse_number(num_str):
     except ValueError:
         return None
 
-def extract_with_llm(text, api_key, sku_header_hint=None):
+def extract_with_llm(text, api_key, example_hints=None):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-2.5-flash')
         
         hint_text = ""
-        if sku_header_hint:
-            hint_text = f"IMPORTANT: The SKU/Product ID is located under the column header '{sku_header_hint}'. Prioritize this column for the 'product_id' field."
+        if example_hints and isinstance(example_hints, dict):
+            hints = []
+            if example_hints.get('sku'):
+                hints.append(f"Look for the value '{example_hints['sku']}' to identify the 'product_id' column.")
+            if example_hints.get('item'):
+                hints.append(f"Look for the value '{example_hints['item']}' to identify the 'product_name' column.")
+            if example_hints.get('qty'):
+                hints.append(f"Look for the value '{example_hints['qty']}' to identify the 'quantity' column.")
+            if example_hints.get('price'):
+                hints.append(f"Look for the value '{example_hints['price']}' to identify the 'unit_price' column.")
+            
+            if hints:
+                hint_text = "IMPORTANT MAPPING HINTS (Use these values to locate columns):\n" + "\n".join(hints)
         
         prompt = f"""
         You are a parser that converts PDF price quotations into structured line items.
@@ -194,7 +205,7 @@ def normalize_sku(sku):
     normalized = str(sku).upper().replace('-', '').replace(' ', '').replace('_', '')
     return normalized
 
-def extract_items_from_text(text, sku_header_hint=None):
+def extract_items_from_text(text, sku_example_hint=None):
     # Simplified heuristic fallback (same logic as app.py but condensed)
     if not text or len(text.strip()) < 10: return []
     items = []
@@ -240,16 +251,16 @@ def extract_items_from_text(text, sku_header_hint=None):
             clean_text_parts = [p.strip(':,.;()') for p in text_parts]
             
             # Check if hint is in this line to learn position
-            if sku_header_hint:
+            if sku_example_hint:
                 # Check exact match or match with stripped punctuation
-                if sku_header_hint in text_parts:
-                    product_id = sku_header_hint
-                    if text_parts.index(sku_header_hint) == 0:
+                if sku_example_hint in text_parts:
+                    product_id = sku_example_hint
+                    if text_parts.index(sku_example_hint) == 0:
                         sku_position_preference = 'first'
-                    elif text_parts.index(sku_header_hint) == len(text_parts) - 1:
+                    elif text_parts.index(sku_example_hint) == len(text_parts) - 1:
                         sku_position_preference = 'last'
-                elif sku_header_hint in clean_text_parts:
-                    idx = clean_text_parts.index(sku_header_hint)
+                elif sku_example_hint in clean_text_parts:
+                    idx = clean_text_parts.index(sku_example_hint)
                     product_id = clean_text_parts[idx] # Use the clean version
                     if idx == 0:
                         sku_position_preference = 'first'
@@ -258,8 +269,8 @@ def extract_items_from_text(text, sku_header_hint=None):
                 else:
                     # Substring match (e.g. "4J-0522:Sello")
                     for part in text_parts:
-                        if sku_header_hint in part:
-                            product_id = sku_header_hint
+                        if sku_example_hint in part:
+                            product_id = sku_example_hint
                             break
             
             # If we haven't found it yet, try using learned preference
@@ -473,21 +484,46 @@ if uploaded_files:
                 )
                 st.session_state.file_discounts[preview_file.name] = file_discount
                 
-                # Get existing hint for this file (if re-visiting)
-                file_hint_key = f"hint_{preview_file.name}"
-                current_hint = st.session_state.file_hints.get(preview_file.name, "")
+                # Get existing hints for this file
+                file_hint_key_base = f"hint_{preview_file.name}"
+                current_hints = st.session_state.file_hints.get(preview_file.name, {})
                 
-                sku_hint_input = st.text_input("SKU Header Hint OR Example SKU (if extraction is wrong)", 
-                                             value=current_hint,
-                                             placeholder="e.g. 'Codigo' OR '4J-0522'",
-                                             help="Enter the column header name OR a specific SKU from the file to help the extractor.",
-                                             key=file_hint_key)
+                st.markdown("**Example Values (Optional):** Help the extractor by providing the FIRST value from each column.")
+                col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+                
+                with col_h1:
+                    sku_hint = st.text_input("First SKU Value", 
+                                           value=current_hints.get('sku', ''),
+                                           placeholder="e.g. 1048566",
+                                           key=f"{file_hint_key_base}_sku")
+                with col_h2:
+                    item_hint = st.text_input("First Item Name", 
+                                            value=current_hints.get('item', ''),
+                                            placeholder="e.g. GAGE-4200",
+                                            key=f"{file_hint_key_base}_item")
+                with col_h3:
+                    qty_hint = st.text_input("First Quantity", 
+                                           value=current_hints.get('qty', ''),
+                                           placeholder="e.g. 1.00",
+                                           key=f"{file_hint_key_base}_qty")
+                with col_h4:
+                    price_hint = st.text_input("First Price", 
+                                             value=current_hints.get('price', ''),
+                                             placeholder="e.g. 5495.45",
+                                             key=f"{file_hint_key_base}_price")
+                
+                # Update hints in session state
+                st.session_state.file_hints[preview_file.name] = {
+                    'sku': sku_hint,
+                    'item': item_hint,
+                    'qty': qty_hint,
+                    'price': price_hint
+                }
                 
                 col1, col2 = st.columns([1, 1])
                 
                 with col1:
                     if st.button(f"Test '{preview_file.name}'", key=f"test_{current_idx}"):
-                        with st.spinner("Extracting preview (scanning all pages)..."):
                             try:
                                 reader = PdfReader(preview_file)
                                 preview_items = []
@@ -501,17 +537,24 @@ if uploaded_files:
                                     if page_num < 3:
                                         debug_text += f"--- Page {page_num+1} ---\n{text[:500]}\n\n"
                                     
-                                    # Run extraction with hint
-                                    page_items = []
-                                    if api_key:
-                                        page_items = extract_with_llm(text, api_key, sku_header_hint=sku_hint_input)
-                                    else:
-                                        page_items = extract_items_from_text(text, sku_header_hint=sku_hint_input)
+                                    # Extract using LLM with example hints
+                                    example_hints = st.session_state.file_hints.get(preview_file.name, {})
+                                    extracted_data = extract_with_llm(text, api_key, example_hints=example_hints)
                                     
-                                    if page_items:
-                                        preview_items = page_items
+                                    if extracted_data:
+                                        preview_items.extend(extracted_data)
                                         found_on_page = page_num + 1
-                                        break # Stop at first page with items
+                                        # Only scan max 3 pages for preview if we found items
+                                        if len(preview_items) > 0:
+                                            break
+                                            
+                                if not preview_items:
+                                    # Fallback: try passing full text if page-by-page failed (sometimes tables span pages)
+                                    full_text = ""
+                                    for page in reader.pages:
+                                        full_text += page.extract_text() + "\n"
+                                    example_hints = st.session_state.file_hints.get(preview_file.name, {})
+                                    preview_items = extract_with_llm(full_text, api_key, example_hints=example_hints)
                                 
                                 if preview_items:
                                     st.success(f"✅ Found {len(preview_items)} items on Page {found_on_page}")
@@ -527,8 +570,8 @@ if uploaded_files:
                 
                 with col2:
                     if st.button("✅ Confirm & Next", key=f"confirm_{current_idx}", type="primary"):
-                        # Save hint for this file
-                        st.session_state.file_hints[preview_file.name] = sku_hint_input
+                        # Hints are already saved in session state above
+                        # Move to next file
                         # Move to next file
                         st.session_state.verification_index += 1
                         st.rerun()
@@ -558,18 +601,21 @@ if uploaded_files:
                         # Default supplier name to filename (minus extension)
                         default_supplier = os.path.splitext(uploaded_file.name)[0]
                         
-                        # Get hint and currency for this specific file
-                        file_hint = st.session_state.file_hints.get(uploaded_file.name, "")
+                        # Get example hints and currency for this specific file
+                        example_hints = st.session_state.file_hints.get(uploaded_file.name, {})
+                        sku_hint = example_hints.get('sku', "") if isinstance(example_hints, dict) else ""
+                        
                         file_currency = st.session_state.file_currencies.get(uploaded_file.name, "DOP")
                         file_tax = st.session_state.file_taxes.get(uploaded_file.name, 0.0)
                         file_discount = st.session_state.file_discounts.get(uploaded_file.name, 0.0)
                         
                         if api_key:
-                            items = extract_with_llm(text, api_key, sku_header_hint=file_hint)
+                            items = extract_with_llm(text, api_key, example_hints=example_hints)
                             if not items:
-                                items = extract_items_from_text(text, sku_header_hint=file_hint)
+                                # Fallback to regex with SKU example
+                                items = extract_items_from_text(text, sku_example_hint=sku_hint)
                         else:
-                            items = extract_items_from_text(text, sku_header_hint=file_hint)
+                            items = extract_items_from_text(text, sku_example_hint=sku_hint)
                         
                         if items:
                             # Normalize and tag with supplier
@@ -619,6 +665,15 @@ if st.session_state.session_items:
     # Prepare DF for editor (hide internal quotation_id)
     editor_df = df.drop(columns=['quotation_id'], errors='ignore')
 
+    # Calculate Net Price for display (read-only)
+    def calculate_net_price_display(row):
+        price = row['unit_price']
+        discount = row.get('discount_rate', 0.0)
+        tax = row.get('tax_rate', 0.0)
+        return price * (1 - discount/100.0) * (1 + tax/100.0)
+
+    editor_df['net_price'] = editor_df.apply(calculate_net_price_display, axis=1)
+
     # Editable Dataframe
     edited_df = st.data_editor(
         editor_df,
@@ -628,8 +683,12 @@ if st.session_state.session_items:
             "product_name": "Product",
             "sku": "Product ID",
             "quantity": st.column_config.NumberColumn("Qty", format="%.2f"),
-            "unit_price": st.column_config.NumberColumn("Price", format="$%.2f"),
-            "total_price": st.column_config.NumberColumn("Total", format="$%.2f"),
+            "unit_price": st.column_config.NumberColumn("Price (Gross)", format="$%.2f"),
+            "total_price": st.column_config.NumberColumn("Total (Gross)", format="$%.2f"),
+            "net_price": st.column_config.NumberColumn("Net Price", format="$%.2f", disabled=True, help="Price after Discount and Tax"),
+            "tax_rate": st.column_config.NumberColumn("Tax %", format="%.1f%%", disabled=True),
+            "discount_rate": st.column_config.NumberColumn("Disc %", format="%.1f%%", disabled=True),
+            "currency": st.column_config.TextColumn("Curr", disabled=True),
         },
         use_container_width=True,
         hide_index=True,
@@ -745,8 +804,8 @@ if st.session_state.session_items:
                     'Supplier Name': row['supplier_name'],
                     'Currency': row.get('currency', 'DOP'),  # Show original currency
                     'Quantity': row['quantity'],
-                    'Price': row['unit_price_dop'],  # Use converted price
-                    'Final Price': row['total_price_dop'],  # Use converted total
+                    'Unit Price (Final)': row['unit_price_dop'],  # Final price with tax/discount
+                    'Total (Final)': row['total_price_dop'],  # Final total with tax/discount
                     'Tax Rate': f"{row.get('tax_rate', 0.0)}%",
                     'Discount Rate': f"{row.get('discount_rate', 0.0)}%"
                 })
@@ -760,8 +819,8 @@ if st.session_state.session_items:
                 'Supplier Name': '',
                 'Currency': None,
                 'Quantity': None,
-                'Price': None,
-                'Final Price': None,
+                'Unit Price (Final)': None,
+                'Total (Final)': None,
                 'Tax Rate': None,
                 'Discount Rate': None
             })
@@ -774,7 +833,7 @@ if st.session_state.session_items:
         
         # Display Editable Table
         st.markdown("### 📝 Price Comparison (Editable)")
-        st.info(f"💡 All prices shown in **DOP** (converted at rate: 1 USD = {exchange_rate} DOP). Edit values directly or delete rows as needed.")
+        st.info(f"💡 **Prices shown include tax and discount applied.** All prices in **DOP** (converted at rate: 1 USD = {exchange_rate} DOP). Edit values directly or delete rows as needed.")
         
         edited_comparison = st.data_editor(
             comparison_display_df,
@@ -789,9 +848,9 @@ if st.session_state.session_items:
                 "Product Name": st.column_config.TextColumn("Product Name", width="large"),
                 "Supplier Name": st.column_config.TextColumn("Supplier Name", width="large"),
                 "Currency": st.column_config.TextColumn("Orig. Currency", width="small", help="Original quotation currency"),
-                "Quantity": st.column_config.NumberColumn("Quantity", format="%.2f"),
-                "Price": st.column_config.NumberColumn("Price (Net)", format="$%.2f", help="After discount and tax"),
-                "Final Price": st.column_config.NumberColumn("Final Price (Net)", format="$%.2f", help="After discount and tax"),
+                "Quantity": st.column_config.NumberColumn("Quantity", width="small"),
+                "Unit Price (Final)": st.column_config.NumberColumn("Unit Price (Final)", format="%.2f", width="medium", help="Final unit price with tax/discount applied"),
+                "Total (Final)": st.column_config.NumberColumn("Total (Final)", format="%.2f", width="medium", help="Final total with tax/discount applied"),
                 "Tax Rate": st.column_config.TextColumn("Tax", width="small"),
                 "Discount Rate": st.column_config.TextColumn("Discount", width="small"),
             }
@@ -826,9 +885,9 @@ if st.session_state.session_items:
                 'Quantity': 'quantity'
             })
             
-            # Reverse currency conversion for Price and Total
+            # Reverse currency conversion for Unit Price (Final) and Total (Final)
             def reverse_price(row):
-                price = row['Price']
+                price = row['Unit Price (Final)']
                 currency = row.get('Currency', 'DOP')
                 tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
                 discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
@@ -854,7 +913,7 @@ if st.session_state.session_items:
                 return price
 
             def reverse_total(row):
-                total = row['Final Price']
+                total = row['Total (Final)']
                 currency = row.get('Currency', 'DOP')
                 tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
                 discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
@@ -931,13 +990,13 @@ if st.session_state.session_items:
                     # Helper to get numeric price
                     def get_final_price(row):
                         try:
-                            return float(row['Final Price'])
+                            return float(row['Total (Final)'])
                         except:
                             return float('inf')
 
                     for _, row in comparison_display_df.iterrows():
                         sku = row['SKU']
-                        price = row['Price']
+                        price = row['Unit Price (Final)']
                         
                         # Check if blank row
                         is_blank = (pd.isna(price) or price == '') and (pd.isna(sku) or sku == '')
@@ -967,7 +1026,7 @@ if st.session_state.session_items:
                         summary_df['Complete Price'] = ''
                         
                         # Calculate Grand Total
-                        grand_total = summary_df['Final Price'].sum()
+                        grand_total = summary_df['Total (Final)'].sum()
                         
                         # Write Main Summary Table
                         summary_df.to_excel(writer, index=False, sheet_name='Summary', startrow=0)
@@ -976,10 +1035,9 @@ if st.session_state.session_items:
                         worksheet_summary = writer.sheets['Summary']
                         last_row = len(summary_df) + 2 # Header + Data + 1 (1-based)
                         worksheet_summary.cell(row=last_row, column=1, value="GRAND TOTAL")
-                        # Find 'Final Price' column index (it's the last one from original data + placeholders)
-                        # Columns: SKU, Product Name, Supplier Name, Quantity, Price, Final Price, Tax, Trans, Complete
-                        # Index: 1, 2, 3, 4, 5, 6, 7, 8, 9
-                        final_price_col = list(summary_df.columns).index('Final Price') + 1
+                        # Find 'Total (Final)' column index
+                        # Columns: SKU, Product Name, Supplier Name, Currency, Quantity, Unit Price (Final), Total (Final), Tax Rate, Discount Rate, Tax, Trans, Complete
+                        final_price_col = list(summary_df.columns).index('Total (Final)') + 1
                         worksheet_summary.cell(row=last_row, column=final_price_col, value=grand_total)
                         
                         # Bold the total row
@@ -1015,7 +1073,7 @@ if st.session_state.session_items:
                                 # Drop internal columns for display
                                 display_vendor_df = vendor_df.drop(columns=['quotation_id'], errors='ignore')
                                 
-                                vendor_total = vendor_df['Final Price'].sum()
+                                vendor_total = vendor_df['Total (Final)'].sum()
                                 
                                 # Write Header
                                 worksheet_summary.cell(row=current_row, column=1, value=f"Winning Items from: {vendor_name}")
@@ -1066,13 +1124,13 @@ if st.session_state.session_items:
                         sku = row['SKU']
                         
                         # Check if this is a blank row (separator)
-                        is_blank = pd.isna(row['Price']) and (pd.isna(sku) or sku == '')
+                        is_blank = pd.isna(row['Unit Price (Final)']) and (pd.isna(sku) or sku == '')
                         
                         if is_blank:
                             # End of a group - process it
                             if group_rows:
-                                # Find min price in this group (USING FINAL PRICE)
-                                prices = [(r, export_df.iloc[r-2]['Final Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Final Price'])]
+                                # Find min price in this group (USING TOTAL FINAL)
+                                prices = [(r, export_df.iloc[r-2]['Total (Final)']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Total (Final)'])]
                                 if prices:
                                     min_row = min(prices, key=lambda x: x[1])[0]
                                     
@@ -1087,7 +1145,7 @@ if st.session_state.session_items:
                     
                     # Process last group if exists
                     if group_rows:
-                        prices = [(r, export_df.iloc[r-2]['Final Price']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Final Price'])]
+                        prices = [(r, export_df.iloc[r-2]['Total (Final)']) for r in group_rows if pd.notna(export_df.iloc[r-2]['Total (Final)'])]
                         if prices:
                             min_row = min(prices, key=lambda x: x[1])[0]
                             
@@ -1130,58 +1188,64 @@ if st.session_state.session_items:
                             # Get items for this quotation
                             q_items = df[df['quotation_id'] == q_id].copy()
                             
-                            # Select relevant columns
-                            sheet_df = q_items[['sku', 'product_name', 'quantity', 'unit_price', 'total_price', 'tax_rate', 'discount_rate']].copy()
+                            # Get tax and discount rates (same for all items in this quotation)
+                            tax_rate = q_items['tax_rate'].iloc[0] if len(q_items) > 0 else 0.0
+                            discount_rate = q_items['discount_rate'].iloc[0] if len(q_items) > 0 else 0.0
                             
-                            # Apply Discount and Tax to Price and Final Price
-                            def calculate_net_price(row):
-                                price = row['unit_price']
-                                discount = row.get('discount_rate', 0.0)
-                                tax = row.get('tax_rate', 0.0)
-                                price_net = price * (1 - discount/100.0) * (1 + tax/100.0)
-                                return price_net
-
-                            def calculate_net_total(row):
-                                total = row['total_price']
-                                discount = row.get('discount_rate', 0.0)
-                                tax = row.get('tax_rate', 0.0)
-                                total_net = total * (1 - discount/100.0) * (1 + tax/100.0)
-                                return total_net
-
-                            sheet_df['unit_price'] = sheet_df.apply(calculate_net_price, axis=1)
-                            sheet_df['total_price'] = sheet_df.apply(calculate_net_total, axis=1)
+                            # Select relevant columns - NO per-row calculations
+                            # Calculate the actual total as unit_price × quantity (without tax or discount)
+                            q_items['item_total'] = q_items['unit_price'] * q_items['quantity']
                             
-                            # Format Tax and Discount for display
-                            sheet_df['tax_rate'] = sheet_df['tax_rate'].apply(lambda x: f"{x}%" if pd.notna(x) else "0%")
-                            sheet_df['discount_rate'] = sheet_df['discount_rate'].apply(lambda x: f"{x}%" if pd.notna(x) else "0%")
-
+                            sheet_df = q_items[['sku', 'product_name', 'quantity', 'unit_price', 'item_total']].copy()
+                            
                             # Rename columns
-                            sheet_df = sheet_df[['sku', 'product_name', 'quantity', 'unit_price', 'total_price', 'tax_rate', 'discount_rate']]
-                            sheet_df.columns = ['SKU', 'Product Name', 'Quantity', 'Price', 'Final Price', 'Tax Rate', 'Discount Rate']
+                            sheet_df.columns = ['SKU', 'Product Name', 'Quantity', 'Unit Price', 'Total']
                             
+                            # Write to Excel
                             sheet_df.to_excel(writer, index=False, sheet_name=sheet_name)
                             
-                            # Add Total Row
+                            # Get worksheet for adding totals
                             worksheet = writer.sheets[sheet_name]
-                            last_row = len(sheet_df) + 2 # Header + Data + 1
-                            
-                            # Calculate Total
-                            total_sum = sheet_df['Final Price'].sum()
-                            
-                            # Write Total Label
-                            worksheet.cell(row=last_row, column=1, value="TOTAL")
-                            
-                            # Write Total Value (Final Price is column 5)
-                            worksheet.cell(row=last_row, column=5, value=total_sum)
-                            
-                            # Bold the total row
                             from openpyxl.styles import Font
                             bold_font = Font(bold=True)
-                            for col in range(1, 8): # Adjusted for new columns
-                                worksheet.cell(row=last_row, column=col).font = bold_font
+                            
+                            # Calculate totals using unit_price × quantity (NOT total_price which may be pre-taxed)
+                            subtotal = sheet_df['Total'].sum()  # This is now unit_price × quantity, no tax
+                            tax_amount = subtotal * (tax_rate / 100.0)
+                            subtotal_with_tax = subtotal + tax_amount
+                            discount_amount = subtotal_with_tax * (discount_rate / 100.0)
+                            final_total = subtotal_with_tax - discount_amount
+                            
+                            # Starting row for totals section (after data + 1 blank row)
+                            totals_start_row = len(sheet_df) + 3
+                            
+                            # Row 1: Subtotal
+                            worksheet.cell(row=totals_start_row, column=4, value="Subtotal:")
+                            worksheet.cell(row=totals_start_row, column=5, value=subtotal)
+                            worksheet.cell(row=totals_start_row, column=4).font = bold_font
+                            worksheet.cell(row=totals_start_row, column=5).font = bold_font
+                            
+                            # Row 2: Tax
+                            worksheet.cell(row=totals_start_row + 1, column=4, value=f"Tax ({tax_rate}%):")
+                            worksheet.cell(row=totals_start_row + 1, column=5, value=tax_amount)
+                            
+                            # Row 3: Subtotal + Tax
+                            worksheet.cell(row=totals_start_row + 2, column=4, value="Subtotal + Tax:")
+                            worksheet.cell(row=totals_start_row + 2, column=5, value=subtotal_with_tax)
+                            worksheet.cell(row=totals_start_row + 2, column=4).font = bold_font
+                            worksheet.cell(row=totals_start_row + 2, column=5).font = bold_font
+                            
+                            # Row 4: Discount
+                            worksheet.cell(row=totals_start_row + 3, column=4, value=f"Discount ({discount_rate}%):")
+                            worksheet.cell(row=totals_start_row + 3, column=5, value=-discount_amount)  # Negative to show it's a reduction
+                            
+                            # Row 5: FINAL TOTAL
+                            worksheet.cell(row=totals_start_row + 4, column=4, value="FINAL TOTAL:")
+                            worksheet.cell(row=totals_start_row + 4, column=5, value=final_total)
+                            worksheet.cell(row=totals_start_row + 4, column=4).font = Font(bold=True, size=12)
+                            worksheet.cell(row=totals_start_row + 4, column=5).font = Font(bold=True, size=12)
                             
                             # Auto-size columns
-                            worksheet = writer.sheets[sheet_name]
                             for idx, col in enumerate(sheet_df.columns):
                                 max_len = len(str(col)) + 2
                                 col_max = sheet_df[col].astype(str).str.len().max()
