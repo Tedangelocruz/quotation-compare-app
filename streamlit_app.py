@@ -27,6 +27,8 @@ def init_db():
     columns = [info[1] for info in c.fetchall()]
     if 'currency' not in columns:
         c.execute("ALTER TABLE quotations ADD COLUMN currency TEXT DEFAULT 'DOP'")
+    if 'tax_rate' not in columns:
+        c.execute("ALTER TABLE quotations ADD COLUMN tax_rate REAL DEFAULT 0.0")
 
     c.execute('''CREATE TABLE IF NOT EXISTS items 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, quotation_id INTEGER, 
@@ -35,10 +37,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_to_db(filename, items, currency='DOP'):
+def save_to_db(filename, items, currency='DOP', tax_rate=0.0):
     conn = sqlite3.connect('quotations.db')
     c = conn.cursor()
-    c.execute("INSERT INTO quotations (filename, currency) VALUES (?, ?)", (filename, currency))
+    c.execute("INSERT INTO quotations (filename, currency, tax_rate) VALUES (?, ?, ?)", (filename, currency, tax_rate))
     quotation_id = c.lastrowid
     
     for item in items:
@@ -78,16 +80,21 @@ def get_items_by_quotation_id(quotation_id):
     try:
         items_df = pd.read_sql_query("SELECT * FROM items WHERE quotation_id = ?", conn, params=(quotation_id,))
         
-        # Get currency for this quotation
-        q_data = pd.read_sql_query("SELECT currency FROM quotations WHERE id = ?", conn, params=(quotation_id,))
+        # Get currency and tax for this quotation
+        q_data = pd.read_sql_query("SELECT currency, tax_rate FROM quotations WHERE id = ?", conn, params=(quotation_id,))
         currency = 'DOP'
-        if not q_data.empty and 'currency' in q_data.columns:
-            currency = q_data.iloc[0]['currency']
+        tax_rate = 0.0
+        if not q_data.empty:
+            if 'currency' in q_data.columns:
+                currency = q_data.iloc[0]['currency']
+            if 'tax_rate' in q_data.columns:
+                tax_rate = q_data.iloc[0]['tax_rate'] or 0.0
             
         items_list = items_df.to_dict('records')
-        # Attach currency to each item
+        # Attach currency and tax to each item
         for item in items_list:
             item['currency'] = currency
+            item['tax_rate'] = tax_rate
         return items_list
     except Exception as e:
         st.error(f"Error fetching items: {e}")
@@ -405,6 +412,8 @@ if uploaded_files:
             st.session_state.file_hints = {}
         if 'file_currencies' not in st.session_state:
             st.session_state.file_currencies = {}
+        if 'file_taxes' not in st.session_state:
+            st.session_state.file_taxes = {}
         
         current_idx = st.session_state.verification_index
         
@@ -427,6 +436,20 @@ if uploaded_files:
                     help="Dominican Pesos (DOP) or US Dollars (USD)"
                 )
                 st.session_state.file_currencies[preview_file.name] = file_currency
+                
+                # Tax Input
+                current_tax = st.session_state.file_taxes.get(preview_file.name, 0.0)
+                file_tax = st.number_input(
+                    "Add Tax Rate (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(current_tax),
+                    step=0.1,
+                    format="%.1f",
+                    key=f"tax_{current_idx}",
+                    help="Enter tax percentage (e.g., 18 for 18%). This will be applied to all item prices."
+                )
+                st.session_state.file_taxes[preview_file.name] = file_tax
                 
                 # Get existing hint for this file (if re-visiting)
                 file_hint_key = f"hint_{preview_file.name}"
@@ -516,6 +539,7 @@ if uploaded_files:
                         # Get hint and currency for this specific file
                         file_hint = st.session_state.file_hints.get(uploaded_file.name, "")
                         file_currency = st.session_state.file_currencies.get(uploaded_file.name, "DOP")
+                        file_tax = st.session_state.file_taxes.get(uploaded_file.name, 0.0)
                         
                         if api_key:
                             items = extract_with_llm(text, api_key, sku_header_hint=file_hint)
@@ -534,8 +558,8 @@ if uploaded_files:
                                 # We create a new quotation record for each file
                                 # This is a bit inefficient (one by one), but reuses existing logic
                             
-                            # Save with currency
-                            q_id = save_to_db(uploaded_file.name, items, currency=file_currency)
+                            # Save with currency and tax
+                            q_id = save_to_db(uploaded_file.name, items, currency=file_currency, tax_rate=file_tax)
                             
                             # Fetch items with currency attached
                             new_db_items_list = get_items_by_quotation_id(q_id)
@@ -555,6 +579,7 @@ if uploaded_files:
                 # Reset verification state
                 st.session_state.verification_index = 0
                 st.session_state.file_hints = {}
+                st.session_state.file_taxes = {}
                 st.rerun()
 
 
@@ -642,20 +667,30 @@ if st.session_state.session_items:
         
         # Apply Currency Conversion (Convert all to DOP for comparison)
         def convert_price_to_dop(row):
-            """Convert price to DOP based on currency"""
+            """Convert price to DOP based on currency and apply tax"""
             price = row['unit_price']
             currency = row.get('currency', 'DOP')
+            tax_rate = row.get('tax_rate', 0.0)
+            
+            # Apply tax first (assuming tax is local to the currency)
+            price_with_tax = price * (1 + (tax_rate / 100.0))
+            
             if currency == 'USD':
-                return price * exchange_rate
-            return price
+                return price_with_tax * exchange_rate
+            return price_with_tax
 
         def convert_total_to_dop(row):
-            """Convert total to DOP based on currency"""
+            """Convert total to DOP based on currency and apply tax"""
             total = row['total_price']
             currency = row.get('currency', 'DOP')
+            tax_rate = row.get('tax_rate', 0.0)
+            
+            # Apply tax
+            total_with_tax = total * (1 + (tax_rate / 100.0))
+            
             if currency == 'USD':
-                return total * exchange_rate
-            return total
+                return total_with_tax * exchange_rate
+            return total_with_tax
 
         df_sorted['unit_price_dop'] = df_sorted.apply(convert_price_to_dop, axis=1)
         df_sorted['total_price_dop'] = df_sorted.apply(convert_total_to_dop, axis=1)
@@ -679,7 +714,8 @@ if st.session_state.session_items:
                     'Currency': row.get('currency', 'DOP'),  # Show original currency
                     'Quantity': row['quantity'],
                     'Price': row['unit_price_dop'],  # Use converted price
-                    'Final Price': row['total_price_dop']  # Use converted total
+                    'Final Price': row['total_price_dop'],  # Use converted total
+                    'Tax Rate': f"{row.get('tax_rate', 0.0)}%"
                 })
             
             # Add a blank row after each group (except the last one)
@@ -692,7 +728,8 @@ if st.session_state.session_items:
                 'Currency': None,
                 'Quantity': None,
                 'Price': None,
-                'Final Price': None
+                'Final Price': None,
+                'Tax Rate': None
             })
         
         # Remove the very last blank row if it exists
@@ -719,8 +756,9 @@ if st.session_state.session_items:
                 "Supplier Name": st.column_config.TextColumn("Supplier Name", width="large"),
                 "Currency": st.column_config.TextColumn("Orig. Currency", width="small", help="Original quotation currency"),
                 "Quantity": st.column_config.NumberColumn("Quantity", format="%.2f"),
-                "Price": st.column_config.NumberColumn("Price (DOP)", format="$%.2f"),
-                "Final Price": st.column_config.NumberColumn("Final Price (DOP)", format="$%.2f"),
+                "Price": st.column_config.NumberColumn("Price (DOP + Tax)", format="$%.2f"),
+                "Final Price": st.column_config.NumberColumn("Final Price (DOP + Tax)", format="$%.2f"),
+                "Tax Rate": st.column_config.TextColumn("Tax", width="small"),
             }
         )
             
@@ -757,15 +795,35 @@ if st.session_state.session_items:
             def reverse_price(row):
                 price = row['Price']
                 currency = row.get('Currency', 'DOP')
+                tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
+                try:
+                    tax_rate = float(tax_str)
+                except:
+                    tax_rate = 0.0
+                
+                # Reverse exchange rate
                 if currency == 'USD' and exchange_rate > 0:
-                    return price / exchange_rate
+                    price = price / exchange_rate
+                
+                # Reverse tax
+                price = price / (1 + (tax_rate / 100.0))
                 return price
 
             def reverse_total(row):
                 total = row['Final Price']
                 currency = row.get('Currency', 'DOP')
+                tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
+                try:
+                    tax_rate = float(tax_str)
+                except:
+                    tax_rate = 0.0
+                
+                # Reverse exchange rate
                 if currency == 'USD' and exchange_rate > 0:
-                    return total / exchange_rate
+                    total = total / exchange_rate
+                
+                # Reverse tax
+                total = total / (1 + (tax_rate / 100.0))
                 return total
 
             updates_df['unit_price'] = updates_df.apply(reverse_price, axis=1)
@@ -1025,6 +1083,25 @@ if st.session_state.session_items:
                             sheet_df.columns = ['SKU', 'Product Name', 'Quantity', 'Price', 'Final Price']
                             
                             sheet_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                            
+                            # Add Total Row
+                            worksheet = writer.sheets[sheet_name]
+                            last_row = len(sheet_df) + 2 # Header + Data + 1
+                            
+                            # Calculate Total
+                            total_sum = sheet_df['Final Price'].sum()
+                            
+                            # Write Total Label
+                            worksheet.cell(row=last_row, column=1, value="TOTAL")
+                            
+                            # Write Total Value (Final Price is column 5)
+                            worksheet.cell(row=last_row, column=5, value=total_sum)
+                            
+                            # Bold the total row
+                            from openpyxl.styles import Font
+                            bold_font = Font(bold=True)
+                            for col in range(1, 6):
+                                worksheet.cell(row=last_row, column=col).font = bold_font
                             
                             # Auto-size columns
                             worksheet = writer.sheets[sheet_name]
