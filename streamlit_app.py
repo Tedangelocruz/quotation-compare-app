@@ -7,13 +7,387 @@ from pypdf import PdfReader
 import google.generativeai as genai
 from io import BytesIO
 import re
+import base64
+
+# Helper function to convert image to base64
+def get_base64_image(image_path):
+    """Convert image to base64 string for HTML embedding"""
+    try:
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    except Exception as e:
+        return ""
 
 # Page Config
 st.set_page_config(
-    page_title="Quotation Compare",
+    page_title="Cotización Rapida",
     page_icon="📊",
     layout="wide"
 )
+
+def inject_custom_css(theme='dark'):
+    # Define theme colors with enhanced palette
+    if theme == 'light':
+        bg_color = "#ffffff"
+        secondary_bg = "#f8f9fa"
+        text_color = "#262730"
+        border_color = "rgba(0, 0, 0, 0.08)"
+        input_bg = "#ffffff"
+        input_border = "#d3d3d3"
+        accent_primary = "#2563eb"  # Darker blue for better contrast
+        accent_secondary = "#059669"  # Darker green
+        accent_warning = "#f59e0b"  # Orange
+        shadow_color = "rgba(0, 0, 0, 0.05)"
+        hover_bg = "rgba(37, 99, 235, 0.05)"
+        button_text = "#ffffff"  # White text on dark buttons
+        button_gradient_start = "#2563eb"
+        button_gradient_end = "#059669"
+    else:  # dark
+        bg_color = "#0e1117"
+        secondary_bg = "#1e2530"
+        text_color = "#fafafa"
+        border_color = "rgba(255, 255, 255, 0.08)"
+        input_bg = "#262730"
+        input_border = "#4a4a4a"
+        accent_primary = "#60a5fa"  # Light blue
+        accent_secondary = "#34d399"  # Bright green
+        accent_warning = "#fbbf24"  # Bright orange
+        shadow_color = "rgba(0, 0, 0, 0.3)"
+        hover_bg = "rgba(96, 165, 250, 0.1)"
+        button_text = "#ffffff"
+        button_gradient_start = "#60a5fa"
+        button_gradient_end = "#34d399"
+    
+    st.markdown(f"""
+        <style>
+        /* Import Google Font */
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+        
+        /* Global Transitions */
+        * {{
+            transition: all 0.2s ease-in-out;
+        }}
+        
+        /* Theme Override */
+        .stApp {{
+            background-color: {bg_color} !important;
+            color: {text_color} !important;
+            font-family: 'Poppins', sans-serif !important;
+        }}
+        
+        /* Sidebar Styling */
+        section[data-testid="stSidebar"] {{
+            background: linear-gradient(180deg, {secondary_bg} 0%, {bg_color} 100%) !important;
+            border-right: 1px solid {border_color};
+        }}
+        
+        section[data-testid="stSidebar"] * {{
+            color: {text_color} !important;
+        }}
+        
+        /* Main Container */
+        .block-container {{
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+            max-width: 95% !important;
+        }}
+        
+        /* Text Elements */
+        p, span, div, label, li, td, th {{
+            color: {text_color} !important;
+        }}
+        
+        /* Headers with Gradients */
+        h1, h2, h3, h4, h5, h6, .stMarkdown h1, [data-testid="stMarkdownContainer"] h1 {{
+            font-family: 'Poppins', sans-serif !important;
+            font-weight: 600 !important;
+            letter-spacing: -0.5px !important;
+            color: {text_color} !important;
+        }}
+        
+        h1 {{
+            background: linear-gradient(135deg, {accent_primary}, {accent_secondary});
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        
+        /* Enhanced Input Fields */
+        input, textarea, select {{
+            background-color: {input_bg} !important;
+            color: {text_color} !important;
+            border: 2px solid {input_border} !important;
+            border-radius: 8px !important;
+            padding: 10px !important;
+            font-family: 'Poppins', sans-serif !important;
+        }}
+        
+        input:focus, textarea:focus, select:focus {{
+            border-color: {accent_primary} !important;
+            box-shadow: 0 0 0 3px {hover_bg} !important;
+            outline: none !important;
+        }}
+        
+        /* Modern Button Styling */
+        .stButton button {{
+            background: linear-gradient(135deg, {button_gradient_start}, {button_gradient_end}) !important;
+            color: {button_text} !important;
+            border: none !important;
+            border-radius: 10px !important;
+            padding: 12px 28px !important;
+            font-weight: 600 !important;
+            font-family: 'Poppins', sans-serif !important;
+            box-shadow: 0 4px 12px {shadow_color} !important;
+            transition: all 0.3s ease !important;
+        }}
+        
+        .stButton button:hover {{
+            transform: translateY(-2px) !important;
+            box-shadow: 0 6px 20px {shadow_color} !important;
+        }}
+        
+        .stButton button:active {{
+            transform: translateY(0px) !important;
+        }}
+        
+        /* Primary Button Variant */
+        .stButton button[kind="primary"] {{
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6) !important;
+        }}
+        
+        /* Enhanced Metric Cards */
+        div[data-testid="stMetric"] {{
+            background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important;
+            padding: 24px !important;
+            border-radius: 16px !important;
+            border: 1px solid {border_color} !important;
+            box-shadow: 0 8px 16px {shadow_color} !important;
+            position: relative !important;
+            overflow: hidden !important;
+        }}
+        
+        div[data-testid="stMetric"]::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(180deg, {accent_primary}, {accent_secondary});
+        }}
+        
+        div[data-testid="stMetric"]:hover {{
+            transform: translateY(-4px) !important;
+            box-shadow: 0 12px 24px {shadow_color} !important;
+            border-color: {accent_primary} !important;
+        }}
+
+        div[data-testid="stMetricLabel"] {{
+            font-size: 0.95rem !important;
+            color: {text_color} !important;
+            opacity: 0.8 !important;
+            font-weight: 500 !important;
+            text-transform: uppercase !important;
+            letter-spacing: 0.5px !important;
+        }}
+
+        div[data-testid="stMetricValue"] {{
+            font-size: 2.2rem !important;
+            font-weight: 700 !important;
+            color: {text_color} !important;
+            margin-top: 8px !important;
+        }}
+        
+        /* Enhanced Tabs */
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: 8px;
+            background-color: {secondary_bg};
+            padding: 8px;
+            border-radius: 12px;
+        }}
+        
+        .stTabs [data-baseweb="tab"] {{
+            height: 50px;
+            white-space: pre-wrap;
+            background-color: transparent;
+            border-radius: 8px;
+            padding: 12px 24px;
+            color: {text_color} !important;
+            font-weight: 500 !important;
+            border: none !important;
+        }}
+        
+        .stTabs [data-baseweb="tab"]:hover {{
+            background-color: {hover_bg};
+        }}
+        
+        .stTabs [aria-selected="true"] {{
+            background: linear-gradient(135deg, {button_gradient_start}, {button_gradient_end}) !important;
+            color: white !important;
+            box-shadow: 0 4px 12px {shadow_color};
+        }}
+        
+        /* Enhanced Data Tables */
+        [data-testid="stDataFrame"] {{
+            border-radius: 12px !important;
+            overflow: hidden !important;
+            box-shadow: 0 4px 12px {shadow_color} !important;
+        }}
+        
+        [data-testid="stDataFrame"] table {{
+            border-collapse: separate !important;
+            border-spacing: 0 !important;
+        }}
+        
+        [data-testid="stDataFrame"] th {{
+            background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important;
+            padding: 16px !important;
+            font-weight: 600 !important;
+            border-bottom: 2px solid {accent_primary} !important;
+        }}
+        
+        [data-testid="stDataFrame"] td {{
+            padding: 14px !important;
+            border-bottom: 1px solid {border_color} !important;
+        }}
+        
+        [data-testid="stDataFrame"] tr:hover {{
+            background-color: {hover_bg} !important;
+        }}
+        
+        /* Enhanced File Uploader */
+        [data-testid="stFileUploader"] {{
+            border: 2px dashed {border_color} !important;
+            border-radius: 16px !important;
+            padding: 32px !important;
+            background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important;
+            transition: all 0.3s ease !important;
+        }}
+        
+        [data-testid="stFileUploader"]:hover {{
+            border-color: {accent_primary} !important;
+            background: {hover_bg} !important;
+        }}
+        
+        /* File Uploader Text */
+        [data-testid="stFileUploader"] label,
+        [data-testid="stFileUploader"] span,
+        [data-testid="stFileUploader"] p,
+        [data-testid="stFileUploader"] small {{
+            color: {text_color} !important;
+        }}
+        
+        /* File Uploader Section - Fix dark background */
+        [data-testid="stFileUploader"] section {{
+            background-color: transparent !important;
+            color: {text_color} !important;
+        }}
+        
+        /* File Uploader Button */
+        [data-testid="stFileUploader"] button {{
+            background-color: {secondary_bg} !important;
+            color: {text_color} !important;
+            border: 1px solid {border_color} !important;
+        }}
+        
+        /* File Uploader Drag Area */
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {{
+            background-color: transparent !important;
+        }}
+        
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] * {{
+            color: {text_color} !important;
+        }}
+        
+        /* Enhanced Expander */
+        .streamlit-expanderHeader {{
+            background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important;
+            border-radius: 12px !important;
+            padding: 16px !important;
+            font-weight: 600 !important;
+            border: 1px solid {border_color} !important;
+        }}
+        
+        .streamlit-expanderHeader:hover {{
+            border-color: {accent_primary} !important;
+            box-shadow: 0 4px 12px {shadow_color} !important;
+        }}
+        
+        /* Enhanced Toast Notifications */
+        .stToast {{
+            background: linear-gradient(135deg, {button_gradient_end}, #059669) !important;
+            color: white !important;
+            border-radius: 12px !important;
+            padding: 16px 24px !important;
+            font-weight: 500 !important;
+            box-shadow: 0 8px 24px {shadow_color} !important;
+        }}
+        
+        /* Info/Warning/Error Messages */
+        .stAlert {{
+            border-radius: 12px !important;
+            border-left: 4px solid {accent_primary} !important;
+            padding: 16px 20px !important;
+            box-shadow: 0 4px 12px {shadow_color} !important;
+        }}
+        
+        /* Progress Bar */
+        .stProgress > div > div > div {{
+            background: linear-gradient(90deg, {accent_primary}, {accent_secondary}) !important;
+            border-radius: 10px !important;
+        }}
+        
+        /* Number Input */
+        [data-testid="stNumberInput"] input {{
+            font-weight: 600 !important;
+        }}
+        
+        /* Divider */
+        hr {{
+            border: none !important;
+            height: 2px !important;
+            background: linear-gradient(90deg, transparent, {border_color}, transparent) !important;
+            margin: 24px 0 !important;
+        }}
+        
+        /* Scrollbar Styling */
+        ::-webkit-scrollbar {{
+            width: 10px;
+            height: 10px;
+        }}
+        
+        ::-webkit-scrollbar-track {{
+            background: {secondary_bg};
+            border-radius: 10px;
+        }}
+        
+        ::-webkit-scrollbar-thumb {{
+            background: linear-gradient(180deg, {accent_primary}, {accent_secondary});
+            border-radius: 10px;
+        }}
+        
+        ::-webkit-scrollbar-thumb:hover {{
+            background: {accent_primary};
+        }}
+        
+        /* Spinner/Loading */
+        .stSpinner > div {{
+            border-top-color: {accent_primary} !important;
+        }}
+        
+        /* Radio Buttons */
+        [data-testid="stRadio"] label {{
+            padding: 8px 16px !important;
+            border-radius: 8px !important;
+        }}
+        
+        [data-testid="stRadio"] label:hover {{
+            background-color: {hover_bg} !important;
+        }}
+        </style>
+    """, unsafe_allow_html=True)
+
+inject_custom_css()
 
 # --- Database Functions ---
 def init_db():
@@ -385,10 +759,39 @@ def clear_session():
     st.session_state.processed_files = set()
     st.rerun()
 
-# --- Main UI ---
-init_db()
+# Initialize theme state
+if 'theme' not in st.session_state:
+    st.session_state.theme = 'dark'
 
-st.title("📊 Quotation Compare")
+# Inject CSS with current theme
+inject_custom_css(st.session_state.theme)
+
+header_text_color = "#262730" if st.session_state.theme == 'light' else "#fafafa"
+
+# Header Layout with HTML for better styling control
+st.markdown(f"""
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2rem;">
+        <div style="flex: 0 0 200px;">
+            <img src="data:image/png;base64,{get_base64_image("assets/logo.png") if os.path.exists("assets/logo.png") else ""}" style="width: 200px; border-radius: 10px;" />
+        </div>
+        <div style="flex: 1; text-align: center;">
+            <img src="data:image/png;base64,{get_base64_image("assets/title_logo.png") if os.path.exists("assets/title_logo.png") else ""}" style="max-width: 400px; height: auto;" />
+        </div>
+        <div style="flex: 0 0 200px; text-align: right; display: flex; align-items: center; justify-content: flex-end; gap: 15px;">
+            <img src="data:image/png;base64,{get_base64_image("assets/header_icon.png") if os.path.exists("assets/header_icon.png") else ""}" style="width: 120px;" />
+        </div>
+    </div>
+""", unsafe_allow_html=True)
+
+# Theme toggle in top right
+col_theme1, col_theme2 = st.columns([10, 1])
+with col_theme2:
+    theme_icon = "🌙" if st.session_state.theme == 'dark' else "☀️"
+    theme_label = "Light Mode" if st.session_state.theme == 'dark' else "Dark Mode"
+    if st.button(theme_icon, help=f"Switch to {theme_label}", key="theme_toggle"):
+        st.session_state.theme = 'light' if st.session_state.theme == 'dark' else 'dark'
+        st.rerun()
 
 with st.sidebar:
     st.header("Session")
@@ -654,312 +1057,340 @@ if uploaded_files:
 
 
 # --- Results Area ---
-st.divider()
-
+# --- Results Area ---
 if st.session_state.session_items:
-    st.subheader(f"Combined Quotations ({len(st.session_state.session_items)} items)")
-    
-    # Convert session items to DataFrame
-    df = pd.DataFrame(st.session_state.session_items)
-    
-    # Prepare DF for editor (hide internal quotation_id)
-    editor_df = df.drop(columns=['quotation_id'], errors='ignore')
-
-    # Calculate Net Price for display (read-only)
-    def calculate_net_price_display(row):
-        price = row['unit_price']
-        discount = row.get('discount_rate', 0.0)
-        tax = row.get('tax_rate', 0.0)
-        return price * (1 - discount/100.0) * (1 + tax/100.0)
-
-    editor_df['net_price'] = editor_df.apply(calculate_net_price_display, axis=1)
-
-    # Editable Dataframe
-    edited_df = st.data_editor(
-        editor_df,
-        column_config={
-            "id": None,  # Hide ID column
-            "supplier_name": "Supplier",
-            "product_name": "Product",
-            "sku": "Product ID",
-            "quantity": st.column_config.NumberColumn("Qty", format="%.2f"),
-            "unit_price": st.column_config.NumberColumn("Price (Gross)", format="$%.2f"),
-            "total_price": st.column_config.NumberColumn("Total (Gross)", format="$%.2f"),
-            "net_price": st.column_config.NumberColumn("Net Price", format="$%.2f", disabled=True, help="Price after Discount and Tax"),
-            "tax_rate": st.column_config.NumberColumn("Tax %", format="%.1f%%", disabled=True),
-            "discount_rate": st.column_config.NumberColumn("Disc %", format="%.1f%%", disabled=True),
-            "currency": st.column_config.TextColumn("Curr", disabled=True),
-        },
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="data_editor"
-    )
-
-    if st.button("💾 Save Changes", type="primary"):
-        if update_items_batch(edited_df):
-            st.success("Changes saved successfully!")
-            # Update session state with edited data
-            # We need to reload from DB or just update in place?
-            # update_items_batch updates DB. We should reload to be safe and get consistent state.
-            # But reloading ALL items might be tricky if we don't track which quotation IDs are in session.
-            # Let's just update the session_items with the edited_df content for now.
-            st.session_state.session_items = edited_df.to_dict('records')
-            st.rerun()
-    
-    # --- Comparison & Export ---
     st.divider()
-    st.subheader("Price Comparison")
     
-    # Comparison Logic
-    if not df.empty:
-        # Ensure we have strings
-        df['sku'] = df['sku'].fillna('')
-        df['product_name'] = df['product_name'].fillna('Unknown Product')
+    # --- Metrics Dashboard ---
+    df = pd.DataFrame(st.session_state.session_items)
+    total_items = len(df)
+    total_suppliers = df['supplier_name'].nunique() if 'supplier_name' in df.columns else 0
+    total_spend = df['total_price'].sum() if 'total_price' in df.columns else 0.0
+    
+    # Calculate Potential Savings (Difference between Max and Min for each SKU)
+    potential_savings = 0.0
+    if 'sku' in df.columns and not df.empty:
+        # Filter valid SKUs
+        valid_skus = df[df['sku'].str.len() >= 6].copy()
+        if not valid_skus.empty:
+            # Group by SKU and find range
+            sku_stats = valid_skus.groupby('sku')['total_price'].agg(['min', 'max'])
+            potential_savings = (sku_stats['max'] - sku_stats['min']).sum()
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("Total Items", total_items)
+    col_m2.metric("Suppliers", total_suppliers)
+    col_m3.metric("Total Value (Gross)", f"${total_spend:,.2f}")
+    col_m4.metric("Potential Savings", f"${potential_savings:,.2f}", help="Difference between highest and lowest quotes for matching items")
+
+    st.markdown("---")
+
+    # --- Tabs ---
+    tab_review, tab_compare, tab_export = st.tabs(["📝 Data Review", "📊 Price Comparison", "📤 Export"])
+
+    # --- Tab 1: Data Review ---
+    with tab_review:
+        st.subheader("Review Extracted Data")
+        st.caption("Verify and edit the extracted data below. Changes are saved to the database.")
         
-        # Filter: Only include rows with SKUs that are at least 6 characters
-        df_filtered = df[df['sku'].str.len() >= 6].copy()
-        
-        if df_filtered.empty:
-            st.warning("No items with SKUs of 6+ characters found for comparison.")
-        else:
-            # Add normalized SKU for grouping (fuzzy matching)
-            df_filtered['normalized_sku'] = df_filtered['sku'].apply(normalize_sku)
-        
-        # Simpler base SKU grouping: find shortest matching prefix
-        def find_base_sku(norm_sku, all_norm_skus):
-            """Find the base SKU by checking which SKUs contain or are contained by this one"""
-            candidates = [norm_sku]
-            for other_sku in all_norm_skus:
-                if not other_sku:
-                    continue
-                # Check if one is a substring of the other
-                if norm_sku in other_sku or other_sku in norm_sku:
-                    candidates.append(other_sku)
-            # Return the shortest one as the base
-            return min(candidates, key=len) if candidates else norm_sku
-        
-        # Get all unique normalized SKUs
-        all_norm_skus = df_filtered['normalized_sku'].unique()
-        
-        # Apply base SKU mapping
-        df_filtered['base_sku'] = df_filtered['normalized_sku'].apply(lambda x: find_base_sku(x, all_norm_skus))
-        
-        # Sort by base SKU and supplier name
-        df_sorted = df_filtered.sort_values(['base_sku', 'supplier_name'])
-        
-        # Apply Currency Conversion (Convert all to DOP for comparison)
-        def convert_price_to_dop(row):
-            """Convert price to DOP based on currency, apply discount then tax"""
+        # Prepare DF for editor (hide internal quotation_id)
+        editor_df = df.drop(columns=['quotation_id'], errors='ignore')
+
+        # Calculate Net Price for display (read-only)
+        def calculate_net_price_display(row):
             price = row['unit_price']
-            currency = row.get('currency', 'DOP')
-            tax_rate = row.get('tax_rate', 0.0)
-            discount_rate = row.get('discount_rate', 0.0)
-            
-            # 1. Apply Discount
-            price_after_discount = price * (1 - (discount_rate / 100.0))
-            
-            # 2. Apply Tax
-            price_with_tax = price_after_discount * (1 + (tax_rate / 100.0))
-            
-            if currency == 'USD':
-                return price_with_tax * exchange_rate
-            return price_with_tax
+            discount = row.get('discount_rate', 0.0)
+            tax = row.get('tax_rate', 0.0)
+            return price * (1 - discount/100.0) * (1 + tax/100.0)
 
-        def convert_total_to_dop(row):
-            """Convert total to DOP based on currency, apply discount then tax"""
-            total = row['total_price']
-            currency = row.get('currency', 'DOP')
-            tax_rate = row.get('tax_rate', 0.0)
-            discount_rate = row.get('discount_rate', 0.0)
-            
-            # 1. Apply Discount
-            total_after_discount = total * (1 - (discount_rate / 100.0))
-            
-            # 2. Apply Tax
-            total_with_tax = total_after_discount * (1 + (tax_rate / 100.0))
-            
-            if currency == 'USD':
-                return total_with_tax * exchange_rate
-            return total_with_tax
+        editor_df['net_price'] = editor_df.apply(calculate_net_price_display, axis=1)
 
-        df_sorted['unit_price_dop'] = df_sorted.apply(convert_price_to_dop, axis=1)
-        df_sorted['total_price_dop'] = df_sorted.apply(convert_total_to_dop, axis=1)
-        
-        # Build display DataFrame with blank rows between SKU groups
-        display_rows = []
-        grouped = df_sorted.groupby('base_sku', sort=False)
-        
-        for idx, (base_sku, group) in enumerate(grouped):
-            if not base_sku:
-                continue
-            
-            # Add all rows from this SKU group
-            for _, row in group.iterrows():
-                display_rows.append({
-                    'id': row['id'],  # Include ID for tracking
-                    'quotation_id': row['quotation_id'], # Include quotation_id for Summary grouping
-                    'SKU': row['sku'],
-                    'Product Name': row['product_name'],
-                    'Supplier Name': row['supplier_name'],
-                    'Currency': row.get('currency', 'DOP'),  # Show original currency
-                    'Quantity': row['quantity'],
-                    'Unit Price (Final)': row['unit_price_dop'],  # Final price with tax/discount
-                    'Total (Final)': row['total_price_dop'],  # Final total with tax/discount
-                    'Tax Rate': f"{row.get('tax_rate', 0.0)}%",
-                    'Discount Rate': f"{row.get('discount_rate', 0.0)}%"
-                })
-            
-            # Add a blank row after each group (except the last one)
-            display_rows.append({
-                'id': None,
-                'quotation_id': None,
-                'SKU': '',
-                'Product Name': '',
-                'Supplier Name': '',
-                'Currency': None,
-                'Quantity': None,
-                'Unit Price (Final)': None,
-                'Total (Final)': None,
-                'Tax Rate': None,
-                'Discount Rate': None
-            })
-        
-        # Remove the very last blank row if it exists
-        if display_rows and display_rows[-1]['SKU'] == '':
-            display_rows.pop()
-            
-        comparison_display_df = pd.DataFrame(display_rows)
-        
-        # Display Editable Table
-        st.markdown("### 📝 Price Comparison (Editable)")
-        st.info(f"💡 **Prices shown include tax and discount applied.** All prices in **DOP** (converted at rate: 1 USD = {exchange_rate} DOP). Edit values directly or delete rows as needed.")
-        
-        edited_comparison = st.data_editor(
-            comparison_display_df,
-            key="price_comparison_editor",
-            num_rows="dynamic",
+        # Editable Dataframe
+        edited_df = st.data_editor(
+            editor_df,
+            column_config={
+                "id": None,  # Hide ID column
+                "supplier_name": "Supplier",
+                "product_name": "Product",
+                "sku": "Product ID",
+                "quantity": st.column_config.NumberColumn("Qty", format="%.2f"),
+                "unit_price": st.column_config.NumberColumn("Price (Gross)", format="$%.2f"),
+                "total_price": st.column_config.NumberColumn("Total (Gross)", format="$%.2f"),
+                "net_price": st.column_config.NumberColumn("Net Price", format="$%.2f", disabled=True, help="Price after Discount and Tax"),
+                "tax_rate": st.column_config.NumberColumn("Tax %", format="%.1f%%", disabled=True),
+                "discount_rate": st.column_config.NumberColumn("Disc %", format="%.1f%%", disabled=True),
+                "currency": st.column_config.TextColumn("Curr", disabled=True),
+            },
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "id": None, # Hide ID column
-                "quotation_id": None, # Hide quotation_id column
-                "SKU": st.column_config.TextColumn("SKU", width="medium"),
-                "Product Name": st.column_config.TextColumn("Product Name", width="large"),
-                "Supplier Name": st.column_config.TextColumn("Supplier Name", width="large"),
-                "Currency": st.column_config.TextColumn("Orig. Currency", width="small", help="Original quotation currency"),
-                "Quantity": st.column_config.NumberColumn("Quantity", width="small"),
-                "Unit Price (Final)": st.column_config.NumberColumn("Unit Price (Final)", format="%.2f", width="medium", help="Final unit price with tax/discount applied"),
-                "Total (Final)": st.column_config.NumberColumn("Total (Final)", format="%.2f", width="medium", help="Final total with tax/discount applied"),
-                "Tax Rate": st.column_config.TextColumn("Tax", width="small"),
-                "Discount Rate": st.column_config.TextColumn("Discount", width="small"),
-            }
+            num_rows="dynamic",
+            key="data_editor"
         )
-            
-        # Save changes button
-        if st.button("💾 Save Comparison Changes", type="primary", key="save_comparison"):
-            # Find deleted rows (IDs in original but not in edited)
-            original_ids = set(comparison_display_df[comparison_display_df['id'].notna()]['id'])
-            current_ids = set(edited_comparison[edited_comparison['id'].notna()]['id'])
-            deleted_ids = original_ids - current_ids
-            
-            # Delete from DB
-            if deleted_ids:
-                conn = sqlite3.connect('quotations.db')
-                c = conn.cursor()
-                for del_id in deleted_ids:
-                    c.execute("DELETE FROM items WHERE id = ?", (int(del_id),))
-                conn.commit()
-                conn.close()
-                st.success(f"Deleted {len(deleted_ids)} items")
-            
-            # Update rows (if price/qty changed)
-            # Prepare data for update (Reverse mapping and conversion)
-            updates_df = edited_comparison[edited_comparison['id'].notna()].copy()
-            
-            # Rename columns to match DB schema
-            updates_df = updates_df.rename(columns={
-                'SKU': 'sku',
-                'Product Name': 'product_name',
-                'Supplier Name': 'supplier_name',
-                'Quantity': 'quantity'
-            })
-            
-            # Reverse currency conversion for Unit Price (Final) and Total (Final)
-            def reverse_price(row):
-                price = row['Unit Price (Final)']
-                currency = row.get('Currency', 'DOP')
-                tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
-                discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
-                try:
-                    tax_rate = float(tax_str)
-                    discount_rate = float(discount_str)
-                except:
-                    tax_rate = 0.0
-                    discount_rate = 0.0
-                
-                # Reverse exchange rate
-                if currency == 'USD' and exchange_rate > 0:
-                    price = price / exchange_rate
-                
-                # Reverse tax
-                price = price / (1 + (tax_rate / 100.0))
-                
-                # Reverse discount (Price_Net = Price_Gross * (1 - Discount/100))
-                # Price_Gross = Price_Net / (1 - Discount/100)
-                if discount_rate < 100:
-                    price = price / (1 - (discount_rate / 100.0))
-                    
-                return price
 
-            def reverse_total(row):
-                total = row['Total (Final)']
-                currency = row.get('Currency', 'DOP')
-                tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
-                discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
-                try:
-                    tax_rate = float(tax_str)
-                    discount_rate = float(discount_str)
-                except:
-                    tax_rate = 0.0
-                    discount_rate = 0.0
+        if st.button("💾 Save Changes", type="primary"):
+            if update_items_batch(edited_df):
+                st.toast("✅ Changes saved successfully!")
+                # Update session state with edited data
+                st.session_state.session_items = edited_df.to_dict('records')
+                st.rerun()
+    
+    # --- Tab 2: Price Comparison ---
+    with tab_compare:
+        st.subheader("Price Comparison")
+        st.caption("Compare prices across suppliers. The lowest price for each item is highlighted.")
+        
+        # Comparison Logic
+        if not df.empty:
+            # Ensure we have strings
+            df['sku'] = df['sku'].fillna('')
+            df['product_name'] = df['product_name'].fillna('Unknown Product')
+            
+            # Filter: Only include rows with SKUs that are at least 6 characters
+            df_filtered = df[df['sku'].str.len() >= 6].copy()
+            
+            if df_filtered.empty:
+                st.warning("No items with SKUs of 6+ characters found for comparison.")
+            else:
+                # Add normalized SKU for grouping (fuzzy matching)
+                df_filtered['normalized_sku'] = df_filtered['sku'].apply(normalize_sku)
+            
+            # Simpler base SKU grouping: find shortest matching prefix
+            def find_base_sku(norm_sku, all_norm_skus):
+                """Find the base SKU by checking which SKUs contain or are contained by this one"""
+                candidates = [norm_sku]
+                for other_sku in all_norm_skus:
+                    if not other_sku:
+                        continue
+                    # Check if one is a substring of the other
+                    if norm_sku in other_sku or other_sku in norm_sku:
+                        candidates.append(other_sku)
+                # Return the shortest one as the base
+                return min(candidates, key=len) if candidates else norm_sku
+            
+            # Get all unique normalized SKUs
+            all_norm_skus = df_filtered['normalized_sku'].unique()
+            
+            # Apply base SKU mapping
+            df_filtered['base_sku'] = df_filtered['normalized_sku'].apply(lambda x: find_base_sku(x, all_norm_skus))
+            
+            # Sort by base SKU and supplier name
+            df_sorted = df_filtered.sort_values(['base_sku', 'supplier_name'])
+            
+            # Apply Currency Conversion (Convert all to DOP for comparison)
+            def convert_price_to_dop(row):
+                """Convert price to DOP based on currency, apply discount then tax"""
+                price = row['unit_price']
+                currency = row.get('currency', 'DOP')
+                tax_rate = row.get('tax_rate', 0.0)
+                discount_rate = row.get('discount_rate', 0.0)
                 
-                # Reverse exchange rate
-                if currency == 'USD' and exchange_rate > 0:
-                    total = total / exchange_rate
+                # 1. Apply Discount
+                price_after_discount = price * (1 - (discount_rate / 100.0))
                 
-                # Reverse tax
-                total = total / (1 + (tax_rate / 100.0))
+                # 2. Apply Tax
+                price_with_tax = price_after_discount * (1 + (tax_rate / 100.0))
                 
-                # Reverse discount
-                if discount_rate < 100:
-                    total = total / (1 - (discount_rate / 100.0))
-                    
-                return total
+                if currency == 'USD':
+                    return price_with_tax * exchange_rate
+                return price_with_tax
 
-            updates_df['unit_price'] = updates_df.apply(reverse_price, axis=1)
-            updates_df['total_price'] = updates_df.apply(reverse_total, axis=1)
+            def convert_total_to_dop(row):
+                """Convert total to DOP based on currency, apply discount then tax"""
+                total = row['total_price']
+                currency = row.get('currency', 'DOP')
+                tax_rate = row.get('tax_rate', 0.0)
+                discount_rate = row.get('discount_rate', 0.0)
+                
+                # 1. Apply Discount
+                total_after_discount = total * (1 - (discount_rate / 100.0))
+                
+                # 2. Apply Tax
+                total_with_tax = total_after_discount * (1 + (tax_rate / 100.0))
+                
+                if currency == 'USD':
+                    return total_with_tax * exchange_rate
+                return total_with_tax
+
+            df_sorted['unit_price_dop'] = df_sorted.apply(convert_price_to_dop, axis=1)
+            df_sorted['total_price_dop'] = df_sorted.apply(convert_total_to_dop, axis=1)
             
-            # Update items
-            update_items_batch(updates_df)
+            # Build display DataFrame with blank rows between SKU groups
+            display_rows = []
+            grouped = df_sorted.groupby('base_sku', sort=False)
             
-            # Reload session_items from DB to reflect changes
-            all_saved_items = []
-            for filename in st.session_state.processed_files:
-                # Get quotation_id(s) for this filename
-                conn = sqlite3.connect('quotations.db')
-                q_ids = pd.read_sql_query("SELECT id FROM quotations WHERE filename = ?", conn, params=(filename,))
-                for q_id in q_ids['id']:
-                    items = get_items_by_quotation_id(q_id)
-                    all_saved_items.extend(items)
-                conn.close()
+            for idx, (base_sku, group) in enumerate(grouped):
+                if not base_sku:
+                    continue
+                
+                # Add all rows from this SKU group
+                for _, row in group.iterrows():
+                    display_rows.append({
+                        'id': row['id'],  # Include ID for tracking
+                        'quotation_id': row['quotation_id'], # Include quotation_id for Summary grouping
+                        'SKU': row['sku'],
+                        'Product Name': row['product_name'],
+                        'Supplier Name': row['supplier_name'],
+                        'Currency': row.get('currency', 'DOP'),  # Show original currency
+                        'Quantity': row['quantity'],
+                        'Unit Price (Final)': row['unit_price_dop'],  # Final price with tax/discount
+                        'Total (Final)': row['total_price_dop'],  # Final total with tax/discount
+                        'Tax Rate': f"{row.get('tax_rate', 0.0)}%",
+                        'Discount Rate': f"{row.get('discount_rate', 0.0)}%"
+                    })
+                
+                # Add a blank row after each group (except the last one)
+                display_rows.append({
+                    'id': None,
+                    'quotation_id': None,
+                    'SKU': '',
+                    'Product Name': '',
+                    'Supplier Name': '',
+                    'Currency': None,
+                    'Quantity': None,
+                    'Unit Price (Final)': None,
+                    'Total (Final)': None,
+                    'Tax Rate': None,
+                    'Discount Rate': None
+                })
             
-            st.session_state.session_items = all_saved_items
-            st.success("✅ Changes saved successfully!")
-            st.rerun()
+            # Remove the very last blank row if it exists
+            if display_rows and display_rows[-1]['SKU'] == '':
+                display_rows.pop()
+                
+            comparison_display_df = pd.DataFrame(display_rows)
+            
+            # Display Editable Table
+            st.info(f"💡 **Prices shown include tax and discount applied.** All prices in **DOP** (converted at rate: 1 USD = {exchange_rate} DOP). Edit values directly or delete rows as needed.")
+            
+            edited_comparison = st.data_editor(
+                comparison_display_df,
+                key="price_comparison_editor",
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "id": None, # Hide ID column
+                    "quotation_id": None, # Hide quotation_id column
+                    "SKU": st.column_config.TextColumn("SKU", width="medium"),
+                    "Product Name": st.column_config.TextColumn("Product Name", width="large"),
+                    "Supplier Name": st.column_config.TextColumn("Supplier Name", width="large"),
+                    "Currency": st.column_config.TextColumn("Orig. Currency", width="small", help="Original quotation currency"),
+                    "Quantity": st.column_config.NumberColumn("Quantity", width="small"),
+                    "Unit Price (Final)": st.column_config.NumberColumn("Unit Price (Final)", format="%.2f", width="medium", help="Final unit price with tax/discount applied"),
+                    "Total (Final)": st.column_config.NumberColumn("Total (Final)", format="%.2f", width="medium", help="Final total with tax/discount applied"),
+                    "Tax Rate": st.column_config.TextColumn("Tax", width="small"),
+                    "Discount Rate": st.column_config.TextColumn("Discount", width="small"),
+                }
+            )
+                
+            # Save changes button
+            if st.button("💾 Save Comparison Changes", type="primary", key="save_comparison"):
+                # Find deleted rows (IDs in original but not in edited)
+                original_ids = set(comparison_display_df[comparison_display_df['id'].notna()]['id'])
+                current_ids = set(edited_comparison[edited_comparison['id'].notna()]['id'])
+                deleted_ids = original_ids - current_ids
+                
+                # Delete from DB
+                if deleted_ids:
+                    conn = sqlite3.connect('quotations.db')
+                    c = conn.cursor()
+                    for del_id in deleted_ids:
+                        c.execute("DELETE FROM items WHERE id = ?", (int(del_id),))
+                    conn.commit()
+                    conn.close()
+                    st.toast(f"Deleted {len(deleted_ids)} items")
+                
+                # Update rows (if price/qty changed)
+                # Prepare data for update (Reverse mapping and conversion)
+                updates_df = edited_comparison[edited_comparison['id'].notna()].copy()
+                
+                # Rename columns to match DB schema
+                updates_df = updates_df.rename(columns={
+                    'SKU': 'sku',
+                    'Product Name': 'product_name',
+                    'Supplier Name': 'supplier_name',
+                    'Quantity': 'quantity'
+                })
+                
+                # Reverse currency conversion for Unit Price (Final) and Total (Final)
+                def reverse_price(row):
+                    price = row['Unit Price (Final)']
+                    currency = row.get('Currency', 'DOP')
+                    tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
+                    discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
+                    try:
+                        tax_rate = float(tax_str)
+                        discount_rate = float(discount_str)
+                    except:
+                        tax_rate = 0.0
+                        discount_rate = 0.0
+                    
+                    # Reverse exchange rate
+                    if currency == 'USD' and exchange_rate > 0:
+                        price = price / exchange_rate
+                    
+                    # Reverse tax
+                    price = price / (1 + (tax_rate / 100.0))
+                    
+                    # Reverse discount (Price_Net = Price_Gross * (1 - Discount/100))
+                    # Price_Gross = Price_Net / (1 - Discount/100)
+                    if discount_rate < 100:
+                        price = price / (1 - (discount_rate / 100.0))
+                        
+                    return price
+
+                def reverse_total(row):
+                    total = row['Total (Final)']
+                    currency = row.get('Currency', 'DOP')
+                    tax_str = str(row.get('Tax Rate', '0')).replace('%', '')
+                    discount_str = str(row.get('Discount Rate', '0')).replace('%', '')
+                    try:
+                        tax_rate = float(tax_str)
+                        discount_rate = float(discount_str)
+                    except:
+                        tax_rate = 0.0
+                        discount_rate = 0.0
+                    
+                    # Reverse exchange rate
+                    if currency == 'USD' and exchange_rate > 0:
+                        total = total / exchange_rate
+                    
+                    # Reverse tax
+                    total = total / (1 + (tax_rate / 100.0))
+                    
+                    # Reverse discount
+                    if discount_rate < 100:
+                        total = total / (1 - (discount_rate / 100.0))
+                        
+                    return total
+
+                updates_df['unit_price'] = updates_df.apply(reverse_price, axis=1)
+                updates_df['total_price'] = updates_df.apply(reverse_total, axis=1)
+                
+                # Update items
+                update_items_batch(updates_df)
+                
+                # Reload session_items from DB to reflect changes
+                all_saved_items = []
+                for filename in st.session_state.processed_files:
+                    # Get quotation_id(s) for this filename
+                    conn = sqlite3.connect('quotations.db')
+                    q_ids = pd.read_sql_query("SELECT id FROM quotations WHERE filename = ?", conn, params=(filename,))
+                    for q_id in q_ids['id']:
+                        items = get_items_by_quotation_id(q_id)
+                        all_saved_items.extend(items)
+                    conn.close()
+                
+                st.session_state.session_items = all_saved_items
+                st.toast("✅ Changes saved successfully!")
+                st.rerun()
+            
+            
+    # --- Tab 3: Export ---
+    with tab_export:
+        st.subheader("Export Reports")
+        st.caption("Download the data in CSV or Excel format.")
         
-        
-        # Export Buttons
         col1, col2 = st.columns(2)
         
         with col1:
@@ -1174,10 +1605,12 @@ if st.session_state.session_items:
                     for q_id in session_q_ids:
                         if pd.isna(q_id): continue
                         
-                        # Get filename for this quotation
-                        q_data = pd.read_sql_query("SELECT filename FROM quotations WHERE id = ?", conn, params=(int(q_id),))
+                        # Get filename and currency for this quotation
+                        q_data = pd.read_sql_query("SELECT filename, currency FROM quotations WHERE id = ?", conn, params=(int(q_id),))
                         if not q_data.empty:
                             filename = q_data.iloc[0]['filename']
+                            currency = q_data.iloc[0]['currency']
+                            
                             # Clean filename for sheet name (Excel limit 31 chars)
                             base_name = os.path.splitext(filename)[0]
                             sheet_name = base_name[:30]
@@ -1192,11 +1625,8 @@ if st.session_state.session_items:
                             tax_rate = q_items['tax_rate'].iloc[0] if len(q_items) > 0 else 0.0
                             discount_rate = q_items['discount_rate'].iloc[0] if len(q_items) > 0 else 0.0
                             
-                            # Select relevant columns - NO per-row calculations
-                            # Calculate the actual total as unit_price × quantity (without tax or discount)
-                            q_items['item_total'] = q_items['unit_price'] * q_items['quantity']
-                            
-                            sheet_df = q_items[['sku', 'product_name', 'quantity', 'unit_price', 'item_total']].copy()
+                            # Use total_price from DB (allows for manual overrides)
+                            sheet_df = q_items[['sku', 'product_name', 'quantity', 'unit_price', 'total_price']].copy()
                             
                             # Rename columns
                             sheet_df.columns = ['SKU', 'Product Name', 'Quantity', 'Unit Price', 'Total']
@@ -1209,12 +1639,17 @@ if st.session_state.session_items:
                             from openpyxl.styles import Font
                             bold_font = Font(bold=True)
                             
-                            # Calculate totals using unit_price × quantity (NOT total_price which may be pre-taxed)
-                            subtotal = sheet_df['Total'].sum()  # This is now unit_price × quantity, no tax
-                            tax_amount = subtotal * (tax_rate / 100.0)
-                            subtotal_with_tax = subtotal + tax_amount
-                            discount_amount = subtotal_with_tax * (discount_rate / 100.0)
-                            final_total = subtotal_with_tax - discount_amount
+                            # Calculate totals using DB Total (Gross)
+                            subtotal = sheet_df['Total'].sum()
+                            
+                            # Align Logic with Summary: Discount THEN Tax
+                            # 1. Discount
+                            discount_amount = subtotal * (discount_rate / 100.0)
+                            subtotal_after_discount = subtotal - discount_amount
+                            
+                            # 2. Tax (on discounted amount)
+                            tax_amount = subtotal_after_discount * (tax_rate / 100.0)
+                            final_total = subtotal_after_discount + tax_amount
                             
                             # Starting row for totals section (after data + 1 blank row)
                             totals_start_row = len(sheet_df) + 3
@@ -1225,25 +1660,35 @@ if st.session_state.session_items:
                             worksheet.cell(row=totals_start_row, column=4).font = bold_font
                             worksheet.cell(row=totals_start_row, column=5).font = bold_font
                             
-                            # Row 2: Tax
-                            worksheet.cell(row=totals_start_row + 1, column=4, value=f"Tax ({tax_rate}%):")
-                            worksheet.cell(row=totals_start_row + 1, column=5, value=tax_amount)
+                            # Row 2: Discount
+                            worksheet.cell(row=totals_start_row + 1, column=4, value=f"Discount ({discount_rate}%):")
+                            worksheet.cell(row=totals_start_row + 1, column=5, value=-discount_amount)
                             
-                            # Row 3: Subtotal + Tax
-                            worksheet.cell(row=totals_start_row + 2, column=4, value="Subtotal + Tax:")
-                            worksheet.cell(row=totals_start_row + 2, column=5, value=subtotal_with_tax)
-                            worksheet.cell(row=totals_start_row + 2, column=4).font = bold_font
-                            worksheet.cell(row=totals_start_row + 2, column=5).font = bold_font
+                            # Row 3: Subtotal after Discount
+                            worksheet.cell(row=totals_start_row + 2, column=4, value="Subtotal (excl. Tax):")
+                            worksheet.cell(row=totals_start_row + 2, column=5, value=subtotal_after_discount)
                             
-                            # Row 4: Discount
-                            worksheet.cell(row=totals_start_row + 3, column=4, value=f"Discount ({discount_rate}%):")
-                            worksheet.cell(row=totals_start_row + 3, column=5, value=-discount_amount)  # Negative to show it's a reduction
+                            # Row 4: Tax
+                            worksheet.cell(row=totals_start_row + 3, column=4, value=f"Tax ({tax_rate}%):")
+                            worksheet.cell(row=totals_start_row + 3, column=5, value=tax_amount)
                             
                             # Row 5: FINAL TOTAL
-                            worksheet.cell(row=totals_start_row + 4, column=4, value="FINAL TOTAL:")
+                            worksheet.cell(row=totals_start_row + 4, column=4, value=f"FINAL TOTAL ({currency}):")
                             worksheet.cell(row=totals_start_row + 4, column=5, value=final_total)
                             worksheet.cell(row=totals_start_row + 4, column=4).font = Font(bold=True, size=12)
                             worksheet.cell(row=totals_start_row + 4, column=5).font = Font(bold=True, size=12)
+                            
+                            # Row 6: DOP Conversion (if USD)
+                            if currency == 'USD':
+                                final_total_dop = final_total * exchange_rate
+                                
+                                worksheet.cell(row=totals_start_row + 5, column=4, value=f"Exchange Rate:")
+                                worksheet.cell(row=totals_start_row + 5, column=5, value=exchange_rate)
+                                
+                                worksheet.cell(row=totals_start_row + 6, column=4, value="FINAL TOTAL (DOP):")
+                                worksheet.cell(row=totals_start_row + 6, column=5, value=final_total_dop)
+                                worksheet.cell(row=totals_start_row + 6, column=4).font = Font(bold=True, size=12, color="008000") # Green
+                                worksheet.cell(row=totals_start_row + 6, column=5).font = Font(bold=True, size=12, color="008000")
                             
                             # Auto-size columns
                             for idx, col in enumerate(sheet_df.columns):
@@ -1254,7 +1699,7 @@ if st.session_state.session_items:
                                 worksheet.column_dimensions[chr(65 + idx)].width = min(max_len, 50)
                     conn.close()
                 
-                st.success(f"✅ Price Comparison Excel generated")
+                st.toast(f"✅ Price Comparison Excel generated")
             
             import time
             timestamp = time.strftime("%Y%m%d-%H%M%S")
