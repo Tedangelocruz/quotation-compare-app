@@ -1,610 +1,188 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-import json
-import os
-from pypdf import PdfReader
-import google.generativeai as genai
-from io import BytesIO
-import re
-import base64
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def get_base64_image(image_path):
-    """Convert image to base64 string for HTML embedding"""
-    try:
-        with open(image_path, "rb") as img_file:
-            return base64.b64encode(img_file.read()).decode()
-    except Exception:
-        return ""
-
-def parse_number(num_str):
-    """Parse localized currency/number strings to float."""
-    if num_str is None:
-        return None
-    if isinstance(num_str, (int, float)):
-        return float(num_str)
-
-    if not isinstance(num_str, str):
-        return None
-
-    clean_str = (
-        num_str.upper()
-        .replace("$", "")
-        .replace("€", "")
-        .replace("S/", "")
-        .replace("USD", "")
-        .replace("EUR", "")
-        .strip()
-    )
-    clean_str = clean_str.replace(" ", "")
-    if not clean_str:
-        return None
-
-    try:
-        if "," in clean_str and "." in clean_str:
-            last_comma = clean_str.rfind(",")
-            last_dot = clean_str.rfind(".")
-            if last_comma > last_dot:  # 1.234,56
-                clean_str = clean_str.replace(".", "").replace(",", ".")
-            else:  # 1,234.56
-                clean_str = clean_str.replace(",", "")
-        elif "," in clean_str:
-            parts = clean_str.split(",")
-            if len(parts[-1]) == 2:
-                clean_str = clean_str.replace(",", ".")
-            elif len(parts[-1]) == 3:
-                clean_str = clean_str.replace(",", "")
-            else:
-                clean_str = clean_str.replace(",", ".")
-        return float(clean_str)
-    except ValueError:
-        return None
-
-def read_pdf_text(uploaded_file):
-    """Try extracting text from PDF pages. Returns combined text."""
-    try:
-        reader = PdfReader(uploaded_file)
-        text = ""
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-        return text
-    except Exception:
-        return ""
-
-# -----------------------------
-# Supplier dropdown options
-# -----------------------------
-SUPPLIER_OPTIONS = [
-    "Auto (recommended)",
-    "IMCA / Parts.Cat (Cart)",
-    "Supplier B (Format B)",
-    "Generic (Gemini / OCR)",
-]
-
-def detect_supplier_format(text: str) -> str:
-    """Auto-detect supplier format based on extracted text."""
-    t = (text or "").lower()
-
-    # IMCA / Parts.Cat cart
-    if "carro de compras" in t and "parts.cat.com" in t:
-        return "IMCA / Parts.Cat (Cart)"
-
-    # CES / Caterpillar Export Services quotation (your PCLT_56Q.... format)
-    if "caterpillar export services" in t or "quote#:" in t or "* q u o t a t i o n *" in t:
-        return "Supplier B (Format B)"
-
-    return "Generic (Gemini / OCR)"
-
-# -----------------------------
-# IMCA / Parts.Cat deterministic extractor (text-based PDFs)
-# -----------------------------
-def extract_parts_cat_cart(text):
-    """
-    Extract items from Parts.Cat / IMCA cart PDF (text-based).
-    Expected pattern per item:
-      <itemNo> <qty> <SKU>: <description>
-      ...
-      DOP
-      $<old> c/u
-      $<new> c/u
-    """
-    items = []
-    pattern = re.compile(
-        r"\n?\d+\s+(\d+(?:\.\d+)?)\s+([A-Z0-9\-]+):\s+(.+?)(?=\nDOP)",
-        re.DOTALL
-    )
-    matches = list(pattern.finditer(text or ""))
-
-    for match in matches:
-        qty = parse_number(match.group(1)) or 0
-        sku = match.group(2).strip()
-        description = " ".join(match.group(3).split()).strip()
-
-        start_pos = match.end()
-        next_slice = (text or "")[start_pos:start_pos + 450]
-
-        prices = re.findall(r"\$([\d,]+\.\d{2})\s*c/u", next_slice)
-        unit_price = None
-        total_price = None
-
-        if prices:
-            unit_price = parse_number(prices[-1])  # last = discounted/current
-            if unit_price is not None:
-                total_price = unit_price * float(qty)
-
-        items.append({
-            "supplier_name": "IMCA / Parts.Cat",
-            "product_name": description,
-            "product_id": sku,
-            "quantity": float(qty),
-            "unit_price": float(unit_price) if unit_price is not None else None,
-            "total_price": float(total_price) if total_price is not None else None
-        })
-
-    return items
-
-# -----------------------------
-# Supplier B (CES Quote) extractor for your PCLT_56Q... format
-# -----------------------------
-def extract_ces_quote(text):
-    """
-    Extract items from Caterpillar Export Services quotation layout:
-    Columns typically:
-      ItemNo  PartNumber  Description  Qty  Pounds  UnitPrice  ExtendedPrice
-    Example line from your PDF:
-      1 178-2345 SENSOR GP 1 .500 180.29 $ 180.29
-    """
-    items = []
-    if not text:
-        return items
-
-    # Narrow to the table region if possible
-    # We take everything after the header line containing "Item Part Qty" up to "TOTAL WEIGHT"
-    start_idx = text.find("Item Part Qty")
-    if start_idx != -1:
-        work = text[start_idx:]
-    else:
-        work = text
-
-    end_match = re.search(r"TOTAL\s+WEIGHT", work, re.IGNORECASE)
-    if end_match:
-        work = work[:end_match.start()]
-
-    lines = [ln.strip() for ln in work.splitlines() if ln.strip()]
-
-    # Regex for a row:
-    # item_no  part_no  description...  qty  pounds  unit_price  $  extended
-    row_re = re.compile(
-        r"^(\d+)\s+([A-Z0-9\-]+)\s+(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+([\d,]+\.\d{2})\s+\$\s*([\d,]+\.\d{2})$"
-    )
-
-    for ln in lines:
-        m = row_re.match(ln)
-        if not m:
-            continue
-
-        item_no = m.group(1)
-        part_no = m.group(2)
-        desc = m.group(3).strip()
-        qty = parse_number(m.group(4))
-        pounds = parse_number(m.group(5))
-        unit_price = parse_number(m.group(6))
-        extended = parse_number(m.group(7))
-
-        items.append({
-            "supplier_name": "Caterpillar Export Services",
-            "product_name": desc,
-            "product_id": part_no,
-            "quantity": float(qty) if qty is not None else None,
-            "unit_price": float(unit_price) if unit_price is not None else None,
-            "total_price": float(extended) if extended is not None else None,
-            # Optional: keep weight in name/notes later if you want; DB schema doesn't include it now
-        })
-
-    return items
-
-# -----------------------------
-# Generic fallback extraction (heuristics)
-# -----------------------------
-def normalize_sku(sku):
-    if not sku or pd.isna(sku):
-        return ''
-    return str(sku).upper().replace('-', '').replace(' ', '').replace('_', '')
-
-def extract_items_from_text(text, sku_example_hint=None):
-    """Heuristic fallback for generic text-based quotations."""
-    if not text or len(text.strip()) < 10:
-        return []
-
-    items = []
-    lines = text.split('\n')
-    supplier_name = "Unknown Supplier"
-
-    for line in lines[:15]:
-        if len(line.strip()) > 3 and "FACTURA" not in line.upper():
-            supplier_name = line.strip()
-            break
-
-    header_keywords = ["DOCUMENTO", "RNC:", "CLIENTE:", "VENDEDOR:", "FECHA:", "TEL:", "PÁGINA", "CANT.", "PRECIO", "DESCRIPCIÓN"]
-    sku_position_preference = None
-
-    for line in lines:
-        line = line.strip()
-        if not line or len(line) < 10:
-            continue
-        if any(kw in line.upper() for kw in header_keywords):
-            continue
-
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-
-        trailing_numbers = []
-        text_parts = []
-        found_text = False
-
-        for i in range(len(parts) - 1, -1, -1):
-            val = parse_number(parts[i])
-            if val is not None and 0 < val < 1000000 and not found_text:
-                trailing_numbers.insert(0, val)
-            else:
-                found_text = True
-                text_parts.insert(0, parts[i])
-
-        if len(trailing_numbers) < 1:
-            continue
-
-        product_id = None
-        clean_text_parts = [p.strip(':,.;()') for p in text_parts]
-
-        if sku_example_hint:
-            if sku_example_hint in text_parts:
-                product_id = sku_example_hint
-                idx = text_parts.index(sku_example_hint)
-                if idx == 0:
-                    sku_position_preference = 'first'
-                elif idx == len(text_parts) - 1:
-                    sku_position_preference = 'last'
-            elif sku_example_hint in clean_text_parts:
-                idx = clean_text_parts.index(sku_example_hint)
-                product_id = clean_text_parts[idx]
-                if idx == 0:
-                    sku_position_preference = 'first'
-                elif idx == len(clean_text_parts) - 1:
-                    sku_position_preference = 'last'
-            else:
-                for part in text_parts:
-                    if sku_example_hint in part:
-                        product_id = sku_example_hint
-                        break
-
-        if product_id is None and sku_position_preference:
-            candidate = None
-            if sku_position_preference == 'first' and clean_text_parts:
-                candidate = clean_text_parts[0]
-            elif sku_position_preference == 'last' and clean_text_parts:
-                candidate = clean_text_parts[-1]
-
-            if candidate and len(candidate) >= 4 and (
-                (any(c.isdigit() for c in candidate) and any(c.isalpha() for c in candidate)) or candidate.isdigit()
-            ):
-                product_id = candidate
-
-        if product_id is None:
-            for part in clean_text_parts:
-                if len(part) >= 4 and (
-                    (any(c.isdigit() for c in part) and any(c.isalpha() for c in part)) or part.isdigit()
-                ):
-                    product_id = part
-                    break
-
-        if product_id is None:
-            continue
-
-        desc_parts = []
-        for p in text_parts:
-            if product_id in p:
-                continue
-            desc_parts.append(p)
-
-        description = " ".join(desc_parts[:20]) if desc_parts else " ".join(text_parts[:20])
-
-        qty = 1.0
-        unit_price = 0.0
-        total_price = 0.0
-
-        if len(trailing_numbers) >= 3:
-            qty = trailing_numbers[0]
-            unit_price = trailing_numbers[1]
-            total_price = trailing_numbers[-1]
-        elif len(trailing_numbers) == 2:
-            unit_price = trailing_numbers[0]
-            total_price = trailing_numbers[1]
-        elif len(trailing_numbers) == 1:
-            total_price = trailing_numbers[0]
-            unit_price = total_price
-
-        items.append({
-            "supplier_name": supplier_name,
-            "product_name": description,
-            "product_id": product_id,
-            "quantity": qty,
-            "unit_price": unit_price,
-            "total_price": total_price
-        })
-
-    return items
-
-# -----------------------------
-# Gemini extraction (text-based)
-# -----------------------------
-def extract_with_llm(text, api_key, example_hints=None):
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-
-        hint_text = ""
-        if example_hints and isinstance(example_hints, dict):
-            hints = []
-            if example_hints.get('sku'):
-                hints.append(f"Look for '{example_hints['sku']}' as product_id.")
-            if example_hints.get('item'):
-                hints.append(f"Look for '{example_hints['item']}' as product_name.")
-            if example_hints.get('qty'):
-                hints.append(f"Look for '{example_hints['qty']}' as quantity.")
-            if example_hints.get('price'):
-                hints.append(f"Look for '{example_hints['price']}' as unit_price.")
-            if hints:
-                hint_text = "HINTS:\n" + "\n".join(hints)
-
-        prompt = f"""
-Return ONLY valid JSON with this schema:
-{{"items":[{{"supplier_name":string,"product_name":string,"product_id":string|null,"quantity":number|null,"unit_price":number|null,"total_price":number|null}}]}}
-
-Rules:
-- If missing, use null (do not invent).
-- No commentary. JSON only.
-{hint_text}
-
-Text:
-{text or ""}
+"""
+Cotización Rapida — Enterprise Quotation Comparison Tool
+Refactored with modular extractor architecture.
 """
 
-        response = model.generate_content(prompt)
-        content = (response.text or "").strip()
+import streamlit as st
+import pandas as pd
+import os
+import time
+from io import BytesIO
 
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
+from utils import get_base64_image, normalize_sku
+from db import (
+    init_db, save_to_db, get_items_by_quotation_id,
+    update_items_batch, delete_items_by_ids, get_quotation_ids_for_filename,
+    get_quotation_metadata
+)
+from pipeline import process_file, preview_detection, get_extractor_names
+from verification import verify_items
 
-        data = json.loads(content)
-        items = data.get("items", []) if isinstance(data, dict) else []
-        return items if isinstance(items, list) else []
-    except Exception as e:
-        st.error(f"LLM Extraction failed: {str(e)}")
-        return []
-
-# -----------------------------
-# Theme / CSS (kept minimal for brevity)
-# -----------------------------
+# Page Config
 st.set_page_config(page_title="Cotización Rapida", page_icon="📊", layout="wide")
+
 
 def inject_custom_css(theme='dark'):
     if theme == 'light':
-        bg_color = "#ffffff"
-        secondary_bg = "#f8f9fa"
-        text_color = "#262730"
-        border_color = "rgba(0, 0, 0, 0.08)"
-        input_bg = "#ffffff"
-        input_border = "#d3d3d3"
-        accent_primary = "#2563eb"
-        accent_secondary = "#059669"
-        shadow_color = "rgba(0, 0, 0, 0.05)"
-        hover_bg = "rgba(37, 99, 235, 0.05)"
-        button_text = "#ffffff"
-        button_gradient_start = "#2563eb"
-        button_gradient_end = "#059669"
+        bg_color, secondary_bg, text_color = "#ffffff", "#f8f9fa", "#262730"
+        border_color, input_bg, input_border = "rgba(0,0,0,0.08)", "#ffffff", "#d3d3d3"
+        accent_primary, accent_secondary = "#2563eb", "#059669"
+        shadow_color, hover_bg = "rgba(0,0,0,0.05)", "rgba(37,99,235,0.05)"
+        button_text, btn_start, btn_end = "#ffffff", "#2563eb", "#059669"
     else:
-        bg_color = "#0e1117"
-        secondary_bg = "#1e2530"
-        text_color = "#fafafa"
-        border_color = "rgba(255, 255, 255, 0.08)"
-        input_bg = "#262730"
-        input_border = "#4a4a4a"
-        accent_primary = "#60a5fa"
-        accent_secondary = "#34d399"
-        shadow_color = "rgba(0, 0, 0, 0.3)"
-        hover_bg = "rgba(96, 165, 250, 0.1)"
-        button_text = "#ffffff"
-        button_gradient_start = "#60a5fa"
-        button_gradient_end = "#34d399"
+        bg_color, secondary_bg, text_color = "#0e1117", "#1e2530", "#fafafa"
+        border_color, input_bg, input_border = "rgba(255,255,255,0.08)", "#262730", "#4a4a4a"
+        accent_primary, accent_secondary = "#60a5fa", "#34d399"
+        shadow_color, hover_bg = "rgba(0,0,0,0.3)", "rgba(96,165,250,0.1)"
+        button_text, btn_start, btn_end = "#ffffff", "#60a5fa", "#34d399"
+    
+    st.markdown(f"""<style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+    * {{ transition: all 0.2s ease-in-out; }}
+    .stApp {{ background-color: {bg_color} !important; color: {text_color} !important; font-family: 'Poppins', sans-serif !important; }}
+    section[data-testid="stSidebar"] {{ background: linear-gradient(180deg, {secondary_bg} 0%, {bg_color} 100%) !important; border-right: 1px solid {border_color}; }}
+    section[data-testid="stSidebar"] * {{ color: {text_color} !important; }}
+    .block-container {{ padding-top: 2rem; padding-bottom: 3rem; max-width: 95% !important; }}
+    p, span, div, label, li, td, th {{ color: {text_color} !important; }}
+    h1, h2, h3, h4, h5, h6 {{ font-family: 'Poppins', sans-serif !important; font-weight: 600 !important; color: {text_color} !important; }}
+    h1 {{ background: linear-gradient(135deg, {accent_primary}, {accent_secondary}); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }}
+    input, textarea, select {{ background-color: {input_bg} !important; color: {text_color} !important; border: 2px solid {input_border} !important; border-radius: 8px !important; padding: 10px !important; font-family: 'Poppins', sans-serif !important; }}
+    input:focus, textarea:focus, select:focus {{ border-color: {accent_primary} !important; box-shadow: 0 0 0 3px {hover_bg} !important; }}
+    .stButton button {{ background: linear-gradient(135deg, {btn_start}, {btn_end}) !important; color: {button_text} !important; border: none !important; border-radius: 10px !important; padding: 12px 28px !important; font-weight: 600 !important; box-shadow: 0 4px 12px {shadow_color} !important; }}
+    .stButton button:hover {{ transform: translateY(-2px) !important; box-shadow: 0 6px 20px {shadow_color} !important; }}
+    div[data-testid="stMetric"] {{ background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important; padding: 24px !important; border-radius: 16px !important; border: 1px solid {border_color} !important; box-shadow: 0 8px 16px {shadow_color} !important; position: relative !important; overflow: hidden !important; }}
+    div[data-testid="stMetric"]::before {{ content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: linear-gradient(180deg, {accent_primary}, {accent_secondary}); }}
+    div[data-testid="stMetric"]:hover {{ transform: translateY(-4px) !important; box-shadow: 0 12px 24px {shadow_color} !important; }}
+    div[data-testid="stMetricLabel"] {{ font-size: 0.95rem !important; opacity: 0.8 !important; font-weight: 500 !important; text-transform: uppercase !important; letter-spacing: 0.5px !important; }}
+    div[data-testid="stMetricValue"] {{ font-size: 2.2rem !important; font-weight: 700 !important; margin-top: 8px !important; }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: 8px; background-color: {secondary_bg}; padding: 8px; border-radius: 12px; }}
+    .stTabs [data-baseweb="tab"] {{ height: 50px; background-color: transparent; border-radius: 8px; padding: 12px 24px; color: {text_color} !important; font-weight: 500 !important; border: none !important; }}
+    .stTabs [aria-selected="true"] {{ background: linear-gradient(135deg, {btn_start}, {btn_end}) !important; color: white !important; }}
+    [data-testid="stDataFrame"] {{ border-radius: 12px !important; overflow: hidden !important; box-shadow: 0 4px 12px {shadow_color} !important; }}
+    [data-testid="stDataFrame"] th {{ background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important; padding: 16px !important; font-weight: 600 !important; border-bottom: 2px solid {accent_primary} !important; }}
+    [data-testid="stFileUploader"] {{ border: 2px dashed {border_color} !important; border-radius: 16px !important; padding: 32px !important; background: linear-gradient(135deg, {secondary_bg}, {bg_color}) !important; }}
+    [data-testid="stFileUploader"]:hover {{ border-color: {accent_primary} !important; }}
+    [data-testid="stFileUploader"] label, [data-testid="stFileUploader"] span, [data-testid="stFileUploader"] p {{ color: {text_color} !important; }}
+    [data-testid="stFileUploader"] section {{ background-color: transparent !important; color: {text_color} !important; }}
+    .stProgress > div > div > div {{ background: linear-gradient(90deg, {accent_primary}, {accent_secondary}) !important; border-radius: 10px !important; }}
+    hr {{ border: none !important; height: 2px !important; background: linear-gradient(90deg, transparent, {border_color}, transparent) !important; margin: 24px 0 !important; }}
+    ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+    ::-webkit-scrollbar-track {{ background: {secondary_bg}; border-radius: 10px; }}
+    ::-webkit-scrollbar-thumb {{ background: linear-gradient(180deg, {accent_primary}, {accent_secondary}); border-radius: 10px; }}
+    .supplier-badge {{ display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 12px; font-weight: 600; font-size: 0.9rem; margin: 4px; }}
+    .badge-deterministic {{ background: linear-gradient(135deg, rgba(16,185,129,0.15), rgba(5,150,105,0.15)); border: 1px solid rgba(16,185,129,0.4); }}
+    .badge-ai {{ background: linear-gradient(135deg, rgba(251,191,36,0.15), rgba(245,158,11,0.15)); border: 1px solid rgba(251,191,36,0.4); }}
+    .badge-manual {{ background: linear-gradient(135deg, rgba(96,165,250,0.15), rgba(59,130,246,0.15)); border: 1px solid rgba(96,165,250,0.4); }}
+    .verify-pass {{ color: #10b981; font-weight: 600; }}
+    .verify-warn {{ color: #f59e0b; font-weight: 600; }}
+    .verify-fail {{ color: #ef4444; font-weight: 600; }}
+    </style>""", unsafe_allow_html=True)
 
-    st.markdown(f"""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
-        .stApp {{
-            background-color: {bg_color} !important;
-            color: {text_color} !important;
-            font-family: 'Poppins', sans-serif !important;
-        }}
-        section[data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, {secondary_bg} 0%, {bg_color} 100%) !important;
-            border-right: 1px solid {border_color};
-        }}
-        .stButton button {{
-            background: linear-gradient(135deg, {button_gradient_start}, {button_gradient_end}) !important;
-            color: {button_text} !important;
-            border: none !important;
-            border-radius: 10px !important;
-            padding: 12px 28px !important;
-            font-weight: 600 !important;
-        }}
-        </style>
-    """, unsafe_allow_html=True)
-
-# -----------------------------
-# Database
-# -----------------------------
-def init_db():
-    conn = sqlite3.connect('quotations.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS quotations 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-
-    c.execute("PRAGMA table_info(quotations)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'currency' not in columns:
-        c.execute("ALTER TABLE quotations ADD COLUMN currency TEXT DEFAULT 'DOP'")
-    if 'tax_rate' not in columns:
-        c.execute("ALTER TABLE quotations ADD COLUMN tax_rate REAL DEFAULT 0.0")
-    if 'discount_rate' not in columns:
-        c.execute("ALTER TABLE quotations ADD COLUMN discount_rate REAL DEFAULT 0.0")
-
-    c.execute('''CREATE TABLE IF NOT EXISTS items 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, quotation_id INTEGER, 
-                  supplier_name TEXT, product_name TEXT, sku TEXT, quantity REAL, 
-                  unit_price REAL, total_price REAL)''')
-    conn.commit()
-    conn.close()
-
-def save_to_db(filename, items, currency='DOP', tax_rate=0.0, discount_rate=0.0):
-    conn = sqlite3.connect('quotations.db')
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO quotations (filename, currency, tax_rate, discount_rate) VALUES (?, ?, ?, ?)",
-        (filename, currency, tax_rate, discount_rate)
-    )
-    quotation_id = c.lastrowid
-
-    for item in items:
-        qty = item.get('quantity') or 0
-        unit = item.get('unit_price') or 0
-        total = item.get('total_price') or (qty * unit)
-        product_id = item.get('product_id', None)
-
-        c.execute(
-            "INSERT INTO items (quotation_id, supplier_name, product_name, sku, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                quotation_id,
-                item.get('supplier_name', 'Unknown'),
-                item.get('product_name', 'Unknown'),
-                product_id,
-                qty,
-                unit,
-                total
-            )
-        )
-
-    conn.commit()
-    conn.close()
-    return quotation_id
-
-def get_items_by_quotation_id(quotation_id):
-    conn = sqlite3.connect('quotations.db')
-    try:
-        items_df = pd.read_sql_query("SELECT * FROM items WHERE quotation_id = ?", conn, params=(quotation_id,))
-        q_data = pd.read_sql_query("SELECT currency, tax_rate, discount_rate FROM quotations WHERE id = ?", conn, params=(quotation_id,))
-        currency = 'DOP'
-        tax_rate = 0.0
-        discount_rate = 0.0
-        if not q_data.empty:
-            currency = q_data.iloc[0].get('currency', 'DOP') or 'DOP'
-            tax_rate = q_data.iloc[0].get('tax_rate', 0.0) or 0.0
-            discount_rate = q_data.iloc[0].get('discount_rate', 0.0) or 0.0
-
-        items_list = items_df.to_dict('records')
-        for item in items_list:
-            item['currency'] = currency
-            item['tax_rate'] = tax_rate
-            item['discount_rate'] = discount_rate
-        return items_list
-    except Exception as e:
-        st.error(f"Error fetching items: {e}")
-        return []
-    finally:
-        conn.close()
-
-def update_items_batch(edited_df):
-    try:
-        conn = sqlite3.connect('quotations.db')
-        c = conn.cursor()
-
-        for _, row in edited_df.iterrows():
-            if 'id' in row and pd.notna(row['id']):
-                c.execute("""
-                    UPDATE items 
-                    SET supplier_name=?, product_name=?, sku=?, quantity=?, unit_price=?, total_price=?
-                    WHERE id=?
-                """, (
-                    row.get('supplier_name'),
-                    row.get('product_name'),
-                    row.get('sku'),
-                    row.get('quantity'),
-                    row.get('unit_price'),
-                    row.get('total_price'),
-                    int(row.get('id'))
-                ))
-
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Error updating database: {e}")
-        return False
-
-# -----------------------------
-# App init / session state
-# -----------------------------
+inject_custom_css()
 init_db()
 
+# --- Session State ---
 if 'session_items' not in st.session_state:
     st.session_state.session_items = []
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = set()
+if 'detection_results' not in st.session_state:
+    st.session_state.detection_results = {}
 if 'theme' not in st.session_state:
     st.session_state.theme = 'dark'
-if 'file_supplier_format' not in st.session_state:
-    st.session_state.file_supplier_format = {}
+
+inject_custom_css(st.session_state.theme)
 
 def clear_session():
     st.session_state.session_items = []
     st.session_state.processed_files = set()
-    st.session_state.file_supplier_format = {}
+    st.session_state.detection_results = {}
     st.rerun()
 
-inject_custom_css(st.session_state.theme)
+# --- Header ---
+st.markdown(f"""
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2rem;">
+        <div style="flex: 0 0 200px;">
+            <img src="data:image/png;base64,{get_base64_image('assets/logo.png') if os.path.exists('assets/logo.png') else ''}" style="width: 200px; border-radius: 10px;" />
+        </div>
+        <div style="flex: 1; text-align: center;">
+            <img src="data:image/png;base64,{get_base64_image('assets/title_logo.png') if os.path.exists('assets/title_logo.png') else ''}" style="max-width: 400px; height: auto;" />
+        </div>
+        <div style="flex: 0 0 200px; text-align: right;">
+            <img src="data:image/png;base64,{get_base64_image('assets/header_icon.png') if os.path.exists('assets/header_icon.png') else ''}" style="width: 120px;" />
+        </div>
+    </div>
+""", unsafe_allow_html=True)
 
-# -----------------------------
-# Sidebar
-# -----------------------------
+# Theme toggle
+col_theme1, col_theme2 = st.columns([10, 1])
+with col_theme2:
+    theme_icon = "🌙" if st.session_state.theme == 'dark' else "☀️"
+    if st.button(theme_icon, help=f"Switch to {'Light' if st.session_state.theme == 'dark' else 'Dark'} Mode", key="theme_toggle"):
+        st.session_state.theme = 'light' if st.session_state.theme == 'dark' else 'dark'
+        st.rerun()
+
+# --- Sidebar ---
 with st.sidebar:
     st.header("Session")
     if st.button("🆕 Start New Quotation", type="primary"):
         clear_session()
-
+    
     st.divider()
     st.header("Settings")
-
+    
     exchange_rate = st.number_input("💱 Exchange Rate (USD to DOP)", value=60.0, min_value=1.0, step=0.1, format="%.2f")
     st.info(f"1 USD = {exchange_rate} DOP")
+    
+    api_key = st.text_input("Gemini API Key (Optional)", type="password", help="For AI-powered extraction of unknown suppliers")
+    
+    st.divider()
+    st.markdown("### 🏗️ Architecture")
+    st.markdown("""
+    - 🟢 **Deterministic** — Known supplier
+    - 🟡 **AI (Gemini)** — Unknown supplier  
+    - 🔵 **Manual** — User override
+    """)
 
-    api_key = st.text_input("Gemini API Key (Optional)", type="password")
-
-# -----------------------------
-# File uploader
-# -----------------------------
-uploaded_files = st.file_uploader("Upload Quotations (PDF)", type="pdf", accept_multiple_files=True)
+# --- File Upload (PDF + Excel) ---
+uploaded_files = st.file_uploader(
+    "Upload Quotations (PDF or Excel)", 
+    type=["pdf", "xlsx", "xls"], 
+    accept_multiple_files=True
+)
 
 if uploaded_files:
     new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_files]
-
+    
     if new_files:
+        # --- Supplier Detection Badges ---
+        st.markdown("### 🔍 Supplier Detection")
+        
+        for f in new_files:
+            if f.name not in st.session_state.detection_results:
+                f.seek(0)
+                detections = preview_detection(f, f.name)
+                f.seek(0)
+                st.session_state.detection_results[f.name] = detections
+            
+            detections = st.session_state.detection_results[f.name]
+            best = detections[0] if detections else None
+            
+            if best:
+                badge_class = f"badge-{best['type']}"
+                st.markdown(
+                    f'<div class="supplier-badge {badge_class}">'
+                    f'📄 <strong>{f.name}</strong> → {best["badge"]}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(f'<div class="supplier-badge badge-manual">📄 <strong>{f.name}</strong> → 🔴 No extractor available</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # --- Verification Flow ---
         if 'verification_index' not in st.session_state:
             st.session_state.verification_index = 0
         if 'file_hints' not in st.session_state:
@@ -615,200 +193,635 @@ if uploaded_files:
             st.session_state.file_taxes = {}
         if 'file_discounts' not in st.session_state:
             st.session_state.file_discounts = {}
-
+        if 'file_overrides' not in st.session_state:
+            st.session_state.file_overrides = {}
+        
         current_idx = st.session_state.verification_index
-
+        
         if current_idx < len(new_files):
             preview_file = new_files[current_idx]
-
+            detections = st.session_state.detection_results.get(preview_file.name, [])
+            best_det = detections[0] if detections else None
+            is_deterministic = best_det and best_det['type'] == 'deterministic'
+            
             with st.expander(f"🔍 Verify File {current_idx + 1}/{len(new_files)}: {preview_file.name}", expanded=True):
-
-                # Supplier dropdown
-                current_format = st.session_state.file_supplier_format.get(preview_file.name, "Auto (recommended)")
-                selected_supplier_format = st.selectbox(
-                    "🏷️ Supplier Format",
-                    SUPPLIER_OPTIONS,
-                    index=SUPPLIER_OPTIONS.index(current_format) if current_format in SUPPLIER_OPTIONS else 0,
-                    key=f"supplier_format_{current_idx}",
+                # Show detection result
+                if best_det:
+                    st.markdown(f"**Detected:** {best_det['badge']}")
+                
+                # Extractor Override
+                available = get_extractor_names()
+                default_idx = 0
+                if best_det and best_det['name'] in available:
+                    default_idx = available.index(best_det['name'])
+                
+                selected_extractor = st.selectbox(
+                    "🔧 Extractor Override",
+                    available,
+                    index=default_idx,
+                    key=f"override_{current_idx}",
+                    help="Override auto-detection if needed"
                 )
-                st.session_state.file_supplier_format[preview_file.name] = selected_supplier_format
-
-                # Currency selection
-                current_currency = st.session_state.file_currencies.get(preview_file.name, "DOP")
-                file_currency = st.radio("💵 Currency", ["DOP", "USD"], index=0 if current_currency == "DOP" else 1, key=f"currency_{current_idx}", horizontal=True)
-                st.session_state.file_currencies[preview_file.name] = file_currency
-
-                # Tax / Discount
-                file_tax = st.number_input("Tax Rate (%)", 0.0, 100.0, float(st.session_state.file_taxes.get(preview_file.name, 0.0)), 0.1, key=f"tax_{current_idx}")
-                st.session_state.file_taxes[preview_file.name] = file_tax
-
-                file_discount = st.number_input("Discount Rate (%)", 0.0, 100.0, float(st.session_state.file_discounts.get(preview_file.name, 0.0)), 0.1, key=f"discount_{current_idx}")
-                st.session_state.file_discounts[preview_file.name] = file_discount
-
-                # Optional hints
-                current_hints = st.session_state.file_hints.get(preview_file.name, {})
-                col_h1, col_h2 = st.columns(2)
-                with col_h1:
-                    sku_hint = st.text_input("Example SKU (optional)", value=current_hints.get('sku', ''), key=f"hint_sku_{current_idx}")
-                with col_h2:
-                    price_hint = st.text_input("Example Price (optional)", value=current_hints.get('price', ''), key=f"hint_price_{current_idx}")
-
-                st.session_state.file_hints[preview_file.name] = {"sku": sku_hint, "price": price_hint}
-
-                # Test button
-                if st.button("🧪 Test Extraction", key=f"test_{current_idx}"):
-                    # IMPORTANT: PdfReader consumes file pointer; Streamlit UploadedFile needs seek(0)
-                    preview_file.seek(0)
-                    text = read_pdf_text(preview_file)
-
-                    chosen = st.session_state.file_supplier_format.get(preview_file.name, "Auto (recommended)")
-                    if chosen == "Auto (recommended)":
-                        chosen = detect_supplier_format(text)
-
-                    # Route
-                    items = []
-                    if chosen == "IMCA / Parts.Cat (Cart)":
-                        items = extract_parts_cat_cart(text)
-                    elif chosen == "Supplier B (Format B)":
-                        items = extract_ces_quote(text)
-                    else:
-                        # Generic
-                        if api_key and text:
-                            items = extract_with_llm(text, api_key, example_hints=st.session_state.file_hints.get(preview_file.name, {}))
-                        if not items and text:
-                            items = extract_items_from_text(text, sku_example_hint=sku_hint)
-
-                    if items:
-                        st.success(f"✅ Extracted {len(items)} items (Format: {chosen})")
-                        st.dataframe(pd.DataFrame(items))
-                    else:
-                        st.warning("No items extracted. If this is truly image-only, you’ll need OCR/Vision under 'Generic (Gemini/OCR)'.")
-                        st.info("This particular CES quote format should extract via text if the PDF contains embedded text.")
-
-                if st.button("✅ Confirm & Next", key=f"confirm_{current_idx}", type="primary"):
-                    st.session_state.verification_index += 1
-                    st.rerun()
-
-            if st.button("⏩ Skip Verification & Process All"):
+                st.session_state.file_overrides[preview_file.name] = selected_extractor
+                
+                # Currency, Tax, Discount
+                col_c, col_t, col_d = st.columns(3)
+                with col_c:
+                    curr = st.session_state.file_currencies.get(preview_file.name, "DOP")
+                    file_currency = st.radio("💵 Currency:", ["DOP", "USD"], index=0 if curr == "DOP" else 1, key=f"currency_{current_idx}", horizontal=True)
+                    st.session_state.file_currencies[preview_file.name] = file_currency
+                with col_t:
+                    file_tax = st.number_input("Tax %", min_value=0.0, max_value=100.0, value=float(st.session_state.file_taxes.get(preview_file.name, 0.0)), step=0.1, key=f"tax_{current_idx}")
+                    st.session_state.file_taxes[preview_file.name] = file_tax
+                with col_d:
+                    file_discount = st.number_input("Discount %", min_value=0.0, max_value=100.0, value=float(st.session_state.file_discounts.get(preview_file.name, 0.0)), step=0.1, key=f"discount_{current_idx}")
+                    st.session_state.file_discounts[preview_file.name] = file_discount
+                
+                # Hints (only for AI/fallback extractors)
+                if not is_deterministic:
+                    st.markdown("**Example Values (Optional):** Help the AI by providing the FIRST value from each column.")
+                    current_hints = st.session_state.file_hints.get(preview_file.name, {})
+                    ch1, ch2, ch3, ch4 = st.columns(4)
+                    with ch1:
+                        sku_hint = st.text_input("First SKU", value=current_hints.get('sku', ''), key=f"hint_sku_{current_idx}")
+                    with ch2:
+                        item_hint = st.text_input("First Item", value=current_hints.get('item', ''), key=f"hint_item_{current_idx}")
+                    with ch3:
+                        qty_hint = st.text_input("First Qty", value=current_hints.get('qty', ''), key=f"hint_qty_{current_idx}")
+                    with ch4:
+                        price_hint = st.text_input("First Price", value=current_hints.get('price', ''), key=f"hint_price_{current_idx}")
+                    st.session_state.file_hints[preview_file.name] = {'sku': sku_hint, 'item': item_hint, 'qty': qty_hint, 'price': price_hint}
+                
+                # Test & Confirm buttons
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    if st.button(f"🧪 Test Extract", key=f"test_{current_idx}"):
+                        try:
+                            preview_file.seek(0)
+                            result = process_file(
+                                preview_file, preview_file.name,
+                                api_key=api_key,
+                                example_hints=st.session_state.file_hints.get(preview_file.name, {}),
+                                override_extractor=st.session_state.file_overrides.get(preview_file.name),
+                            )
+                            if result.items:
+                                st.success(f"✅ Found {len(result.items)} items")
+                                st.markdown(f"**Extractor:** {result.badge_text}")
+                                verify = verify_items(result.items)
+                                css_class = f"verify-{'pass' if verify.status_emoji == '✅' else 'warn' if verify.status_emoji == '⚠️' else 'fail'}"
+                                st.markdown(f'<span class="{css_class}">{verify.status_emoji} {verify.status_text}</span>', unsafe_allow_html=True)
+                                preview_df = pd.DataFrame(result.items)
+                                show_cols = [c for c in ['product_id', 'product_name', 'quantity', 'unit_price', 'total_price', 'equipment'] if c in preview_df.columns]
+                                st.dataframe(preview_df[show_cols])
+                            else:
+                                st.warning("No items extracted. Try adding hints or changing the extractor.")
+                        except Exception as e:
+                            st.error(f"Test failed: {e}")
+                
+                with col_btn2:
+                    if st.button("✅ Confirm & Next", key=f"confirm_{current_idx}", type="primary"):
+                        st.session_state.verification_index += 1
+                        st.rerun()
+            
+            if st.button("⏩ Skip Verification & Process All", key="skip_verification"):
                 st.session_state.verification_index = len(new_files)
                 st.rerun()
-
+        
         else:
+            # All verified — Process
             st.success(f"✅ All {len(new_files)} files verified! Ready to process.")
-
+            
             if st.button("🚀 Process All Files", type="primary"):
-                progress = st.progress(0)
-                status = st.empty()
-
-                for idx, f in enumerate(new_files):
-                    status.text(f"Processing {f.name}...")
-                    f.seek(0)
-                    text = read_pdf_text(f)
-
-                    chosen = st.session_state.file_supplier_format.get(f.name, "Auto (recommended)")
-                    if chosen == "Auto (recommended)":
-                        chosen = detect_supplier_format(text)
-
-                    example_hints = st.session_state.file_hints.get(f.name, {})
-                    sku_hint = example_hints.get("sku", "")
-
-                    items = []
-                    if chosen == "IMCA / Parts.Cat (Cart)":
-                        items = extract_parts_cat_cart(text)
-                    elif chosen == "Supplier B (Format B)":
-                        items = extract_ces_quote(text)
-                    else:
-                        if api_key and text:
-                            items = extract_with_llm(text, api_key, example_hints=example_hints)
-                        if not items and text:
-                            items = extract_items_from_text(text, sku_example_hint=sku_hint)
-
-                    # Save
-                    if items:
-                        file_currency = st.session_state.file_currencies.get(f.name, "DOP")
-                        file_tax = st.session_state.file_taxes.get(f.name, 0.0)
-                        file_discount = st.session_state.file_discounts.get(f.name, 0.0)
-
-                        q_id = save_to_db(f.name, items, currency=file_currency, tax_rate=file_tax, discount_rate=file_discount)
-                        st.session_state.session_items.extend(get_items_by_quotation_id(q_id))
-                        st.session_state.processed_files.add(f.name)
-                        st.toast(f"✅ {f.name}: {len(items)} items ({chosen})")
-                    else:
-                        st.warning(f"{f.name}: no items extracted.")
-
-                    progress.progress((idx + 1) / len(new_files))
-
-                status.text("Done.")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for idx, uploaded_file in enumerate(new_files):
+                    status_text.text(f"Processing {uploaded_file.name}...")
+                    try:
+                        uploaded_file.seek(0)
+                        result = process_file(
+                            uploaded_file, uploaded_file.name,
+                            api_key=api_key,
+                            example_hints=st.session_state.file_hints.get(uploaded_file.name, {}),
+                            override_extractor=st.session_state.file_overrides.get(uploaded_file.name),
+                        )
+                        
+                        if result.items:
+                            default_supplier = os.path.splitext(uploaded_file.name)[0]
+                            for item in result.items:
+                                if not item.get('supplier_name') or item['supplier_name'] == "Unknown Supplier":
+                                    item['supplier_name'] = default_supplier
+                            
+                            file_currency = st.session_state.file_currencies.get(uploaded_file.name, result.currency or "DOP")
+                            file_tax = st.session_state.file_taxes.get(uploaded_file.name, 0.0)
+                            file_discount = st.session_state.file_discounts.get(uploaded_file.name, 0.0)
+                            
+                            # Verification status
+                            v = result.verification
+                            v_status = v.status.value if hasattr(v.status, 'value') else str(v.status)
+                            
+                            q_id = save_to_db(
+                                uploaded_file.name, result.items,
+                                currency=file_currency, tax_rate=file_tax, discount_rate=file_discount,
+                                supplier_detected=result.supplier_name,
+                                extractor_used=result.extractor_name,
+                                detection_confidence=result.confidence,
+                                verification_status=v_status,
+                            )
+                            
+                            new_db_items = get_items_by_quotation_id(q_id)
+                            st.session_state.session_items.extend(new_db_items)
+                            st.session_state.processed_files.add(uploaded_file.name)
+                            st.toast(f"✅ {len(result.items)} items from {uploaded_file.name} ({result.badge_text})")
+                        else:
+                            st.warning(f"Could not extract items from {uploaded_file.name}")
+                    except Exception as e:
+                        st.error(f"Error processing {uploaded_file.name}: {e}")
+                    
+                    progress_bar.progress((idx + 1) / len(new_files))
+                
+                status_text.text("Processing complete!")
                 st.session_state.verification_index = 0
                 st.session_state.file_hints = {}
                 st.session_state.file_taxes = {}
                 st.session_state.file_discounts = {}
+                st.session_state.file_overrides = {}
+                st.session_state.detection_results = {}
                 st.rerun()
 
-# -----------------------------
-# Results
-# -----------------------------
+# --- Results Area ---
 if st.session_state.session_items:
     st.divider()
     df = pd.DataFrame(st.session_state.session_items)
+    total_items = len(df)
+    total_suppliers = df['supplier_name'].nunique() if 'supplier_name' in df.columns else 0
+    total_spend = df['total_price'].sum() if 'total_price' in df.columns else 0.0
+    
+    potential_savings = 0.0
+    if 'sku' in df.columns and not df.empty:
+        valid_skus = df[df['sku'].astype(str).str.len() >= 6].copy()
+        if not valid_skus.empty:
+            sku_stats = valid_skus.groupby('sku')['total_price'].agg(['min', 'max'])
+            potential_savings = (sku_stats['max'] - sku_stats['min']).sum()
 
-    st.metric("Total Items", len(df))
-    st.metric("Suppliers", df['supplier_name'].nunique() if 'supplier_name' in df.columns else 0)
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("Total Items", total_items)
+    col_m2.metric("Suppliers", total_suppliers)
+    col_m3.metric("Total Value (Gross)", f"${total_spend:,.2f}")
+    col_m4.metric("Potential Savings", f"${potential_savings:,.2f}")
 
-    tab_review, tab_compare, tab_export = st.tabs(["📝 Review", "📊 Compare", "📤 Export"])
+    st.markdown("---")
 
+    tab_review, tab_compare, tab_export = st.tabs(["📝 Data Review", "📊 Price Comparison", "📤 Export"])
+
+    # --- Tab 1: Data Review ---
     with tab_review:
-        st.subheader("Review / Edit")
+        st.subheader("Review Extracted Data")
+        
+        # Show extraction method badges
+        if 'extractor_used' in df.columns:
+            extractors_used = df[['supplier_name', 'extractor_used', 'detection_confidence', 'verification_status']].drop_duplicates()
+            for _, row in extractors_used.iterrows():
+                ext_type = 'deterministic' if row.get('extractor_used') not in ['AI (Gemini)', 'manual'] else ('ai' if row.get('extractor_used') == 'AI (Gemini)' else 'manual')
+                badge_cls = f"badge-{ext_type}"
+                conf = int(float(row.get('detection_confidence', 0)) * 100)
+                v_status = row.get('verification_status', 'pending')
+                v_class = f"verify-{'pass' if v_status == 'pass' else 'warn' if v_status == 'warn' else 'fail'}"
+                v_emoji = '✅' if v_status == 'pass' else '⚠️' if v_status == 'warn' else '❌' if v_status == 'fail' else '⏳'
+                
+                st.markdown(
+                    f'<div class="supplier-badge {badge_cls}">'
+                    f'{row["supplier_name"]} — {row.get("extractor_used", "?")} ({conf}%)'
+                    f' | <span class="{v_class}">{v_emoji} {v_status}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+        
+        editor_df = df.drop(columns=['quotation_id', 'supplier_detected', 'extractor_used', 'detection_confidence', 'verification_status'], errors='ignore')
+
+        def calculate_net_price(row):
+            price = row.get('unit_price', 0) or 0
+            discount = row.get('discount_rate', 0.0) or 0
+            tax = row.get('tax_rate', 0.0) or 0
+            return price * (1 - discount/100.0) * (1 + tax/100.0)
+        
+        editor_df['net_price'] = editor_df.apply(calculate_net_price, axis=1)
+
         edited_df = st.data_editor(
-            df.drop(columns=['quotation_id'], errors='ignore'),
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic"
+            editor_df,
+            column_config={
+                "id": None,
+                "supplier_name": "Supplier",
+                "product_name": "Product",
+                "sku": "Product ID",
+                "quantity": st.column_config.NumberColumn("Qty", format="%.2f"),
+                "unit_price": st.column_config.NumberColumn("Price (Gross)", format="$%.2f"),
+                "total_price": st.column_config.NumberColumn("Total (Gross)", format="$%.2f"),
+                "net_price": st.column_config.NumberColumn("Net Price", format="$%.2f", disabled=True),
+                "tax_rate": st.column_config.NumberColumn("Tax %", format="%.1f%%", disabled=True),
+                "discount_rate": st.column_config.NumberColumn("Disc %", format="%.1f%%", disabled=True),
+                "currency": st.column_config.TextColumn("Curr", disabled=True),
+                "equipment": st.column_config.TextColumn("Equipment", disabled=True),
+            },
+            use_container_width=True, hide_index=True, num_rows="dynamic", key="data_editor"
         )
-        if st.button("💾 Save Changes"):
+
+        if st.button("💾 Save Changes", type="primary"):
             if update_items_batch(edited_df):
+                st.toast("✅ Changes saved!")
                 st.session_state.session_items = edited_df.to_dict('records')
-                st.success("Saved.")
                 st.rerun()
-
+    
+    # --- Tab 2: Price Comparison ---
     with tab_compare:
-        st.subheader("Comparison (by SKU)")
-        df2 = df.copy()
-        df2['sku'] = df2['sku'].fillna('')
-        df2 = df2[df2['sku'].str.len() >= 4].copy()
-        if df2.empty:
-            st.warning("No valid SKUs to compare.")
-        else:
-            df2['normalized_sku'] = df2['sku'].apply(normalize_sku)
+        st.subheader("Price Comparison")
+        
+        if not df.empty:
+            df['sku'] = df['sku'].fillna('')
+            df['product_name'] = df['product_name'].fillna('Unknown Product')
+            df_filtered = df[df['sku'].astype(str).str.len() >= 6].copy()
+            
+            if df_filtered.empty:
+                st.warning("No items with SKUs of 6+ characters found.")
+            else:
+                df_filtered['normalized_sku'] = df_filtered['sku'].apply(normalize_sku)
+                
+                def find_base_sku(norm_sku, all_norm):
+                    candidates = [norm_sku]
+                    for other in all_norm:
+                        if not other: continue
+                        if norm_sku in other or other in norm_sku:
+                            candidates.append(other)
+                    return min(candidates, key=len) if candidates else norm_sku
+                
+                all_norm = df_filtered['normalized_sku'].unique()
+                df_filtered['base_sku'] = df_filtered['normalized_sku'].apply(lambda x: find_base_sku(x, all_norm))
+                df_sorted = df_filtered.sort_values(['base_sku', 'supplier_name'])
+                
+                def convert_price_to_dop(row):
+                    price = row['unit_price']
+                    d_rate = row.get('discount_rate', 0.0) or 0
+                    t_rate = row.get('tax_rate', 0.0) or 0
+                    price = price * (1 - d_rate/100.0) * (1 + t_rate/100.0)
+                    if row.get('currency') == 'USD':
+                        price *= exchange_rate
+                    return price
 
-            # Convert prices to DOP if needed
-            def to_dop(row):
-                unit = row.get('unit_price', 0.0) or 0.0
-                cur = row.get('currency', 'DOP')
-                if cur == 'USD':
-                    return unit * exchange_rate
-                return unit
+                def convert_total_to_dop(row):
+                    total = row['total_price']
+                    d_rate = row.get('discount_rate', 0.0) or 0
+                    t_rate = row.get('tax_rate', 0.0) or 0
+                    total = total * (1 - d_rate/100.0) * (1 + t_rate/100.0)
+                    if row.get('currency') == 'USD':
+                        total *= exchange_rate
+                    return total
+                
+                df_sorted['unit_price_dop'] = df_sorted.apply(convert_price_to_dop, axis=1)
+                df_sorted['total_price_dop'] = df_sorted.apply(convert_total_to_dop, axis=1)
+                
+                display_rows = []
+                grouped = df_sorted.groupby('base_sku', sort=False)
+                for i, (base_sku, group) in enumerate(grouped):
+                    if not base_sku: continue
+                    for _, row in group.iterrows():
+                        display_rows.append({
+                            'id': row['id'], 'quotation_id': row['quotation_id'],
+                            'SKU': row['sku'], 'Product Name': row['product_name'],
+                            'Supplier Name': row['supplier_name'],
+                            'Currency': row.get('currency', 'DOP'),
+                            'Quantity': row['quantity'],
+                            'Unit Price (Final)': row['unit_price_dop'],
+                            'Total (Final)': row['total_price_dop'],
+                            'Tax Rate': f"{row.get('tax_rate', 0.0)}%",
+                            'Discount Rate': f"{row.get('discount_rate', 0.0)}%",
+                        })
+                    display_rows.append({k: None if k != 'SKU' else '' for k in ['id','quotation_id','SKU','Product Name','Supplier Name','Currency','Quantity','Unit Price (Final)','Total (Final)','Tax Rate','Discount Rate']})
+                
+                if display_rows and display_rows[-1].get('SKU') == '':
+                    display_rows.pop()
+                
+                comparison_display_df = pd.DataFrame(display_rows)
+                
+                st.info(f"💡 Prices include tax/discount. All in **DOP** (1 USD = {exchange_rate} DOP).")
+                
+                edited_comparison = st.data_editor(
+                    comparison_display_df, key="price_comparison_editor",
+                    num_rows="dynamic", use_container_width=True, hide_index=True,
+                    column_config={
+                        "id": None, "quotation_id": None,
+                        "SKU": st.column_config.TextColumn("SKU", width="medium"),
+                        "Product Name": st.column_config.TextColumn("Product Name", width="large"),
+                        "Supplier Name": st.column_config.TextColumn("Supplier Name", width="large"),
+                        "Currency": st.column_config.TextColumn("Orig. Currency", width="small"),
+                        "Quantity": st.column_config.NumberColumn("Quantity", width="small"),
+                        "Unit Price (Final)": st.column_config.NumberColumn("Unit Price (Final)", format="%.2f", width="medium"),
+                        "Total (Final)": st.column_config.NumberColumn("Total (Final)", format="%.2f", width="medium"),
+                        "Tax Rate": st.column_config.TextColumn("Tax", width="small"),
+                        "Discount Rate": st.column_config.TextColumn("Discount", width="small"),
+                    }
+                )
+                
+                if st.button("💾 Save Comparison Changes", type="primary", key="save_comparison"):
+                    original_ids = set(comparison_display_df[comparison_display_df['id'].notna()]['id'])
+                    current_ids = set(edited_comparison[edited_comparison['id'].notna()]['id'])
+                    deleted_ids = original_ids - current_ids
+                    
+                    if deleted_ids:
+                        delete_items_by_ids(deleted_ids)
+                        st.toast(f"Deleted {len(deleted_ids)} items")
+                    
+                    updates_df = edited_comparison[edited_comparison['id'].notna()].copy()
+                    updates_df = updates_df.rename(columns={'SKU': 'sku', 'Product Name': 'product_name', 'Supplier Name': 'supplier_name', 'Quantity': 'quantity'})
+                    
+                    def reverse_price(row):
+                        p = row['Unit Price (Final)']
+                        try:
+                            t = float(str(row.get('Tax Rate', '0')).replace('%', ''))
+                            d = float(str(row.get('Discount Rate', '0')).replace('%', ''))
+                        except: t, d = 0, 0
+                        if row.get('Currency') == 'USD' and exchange_rate > 0: p /= exchange_rate
+                        p /= (1 + t/100)
+                        if d < 100: p /= (1 - d/100)
+                        return p
+                    
+                    def reverse_total(row):
+                        t_val = row['Total (Final)']
+                        try:
+                            t = float(str(row.get('Tax Rate', '0')).replace('%', ''))
+                            d = float(str(row.get('Discount Rate', '0')).replace('%', ''))
+                        except: t, d = 0, 0
+                        if row.get('Currency') == 'USD' and exchange_rate > 0: t_val /= exchange_rate
+                        t_val /= (1 + t/100)
+                        if d < 100: t_val /= (1 - d/100)
+                        return t_val
+                    
+                    updates_df['unit_price'] = updates_df.apply(reverse_price, axis=1)
+                    updates_df['total_price'] = updates_df.apply(reverse_total, axis=1)
+                    update_items_batch(updates_df)
+                    
+                    all_saved = []
+                    for fn in st.session_state.processed_files:
+                        for q_id in get_quotation_ids_for_filename(fn):
+                            all_saved.extend(get_items_by_quotation_id(q_id))
+                    st.session_state.session_items = all_saved
+                    st.toast("✅ Changes saved!")
+                    st.rerun()
 
-            df2['unit_price_dop'] = df2.apply(to_dop, axis=1)
-            pivot = df2.pivot_table(
-                index=['normalized_sku', 'sku', 'product_name'],
-                columns='supplier_name',
-                values='unit_price_dop',
-                aggfunc='min'
-            ).reset_index()
-
-            st.dataframe(pivot, use_container_width=True)
-
+    # --- Tab 3: Export ---
     with tab_export:
-        st.subheader("Export")
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name="All Items")
-        st.download_button(
-            "📥 Download Excel",
-            buffer.getvalue(),
-            "quotation_export.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.subheader("Export Reports")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            csv = edited_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Combined CSV", csv, "combined_quotations.csv", "text/csv", key='download-csv')
+        
+        with col2:
+            buffer = BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                if 'comparison_display_df' in locals() and not comparison_display_df.empty:
+                    summary_rows = []
+                    group_rows_list = []
+                    
+                    def get_final_p(row):
+                        try: return float(row['Total (Final)'])
+                        except: return float('inf')
+                    
+                    for _, row in comparison_display_df.iterrows():
+                        is_blank = (pd.isna(row.get('Unit Price (Final)')) or row.get('Unit Price (Final)') == '') and (pd.isna(row.get('SKU')) or row.get('SKU') == '')
+                        if is_blank:
+                            if group_rows_list:
+                                summary_rows.append(min(group_rows_list, key=get_final_p))
+                                group_rows_list = []
+                        else:
+                            group_rows_list.append(row)
+                    if group_rows_list:
+                        summary_rows.append(min(group_rows_list, key=get_final_p))
+                    
+                    if summary_rows:
+                        summary_df = pd.DataFrame(summary_rows).drop(columns=['id'], errors='ignore')
+                        summary_df['Tax'] = ''
+                        summary_df['Transportation Cost'] = ''
+                        summary_df['Complete Price'] = ''
+                        grand_total = summary_df['Total (Final)'].sum()
+                        
+                        summary_df.to_excel(writer, index=False, sheet_name='Summary', startrow=0)
+                        ws = writer.sheets['Summary']
+                        from openpyxl.styles import Font, PatternFill
+                        bold = Font(bold=True)
+                        lr = len(summary_df) + 2
+                        ws.cell(row=lr, column=1, value="GRAND TOTAL")
+                        fp_col = list(summary_df.columns).index('Total (Final)') + 1
+                        ws.cell(row=lr, column=fp_col, value=grand_total)
+                        for c in range(1, len(summary_df.columns) + 1):
+                            ws.cell(row=lr, column=c).font = bold
+                    
+                    export_cdf = comparison_display_df.drop(columns=['id'], errors='ignore')
+                    export_cdf.to_excel(writer, index=False, sheet_name='Price Comparison')
+                    ws2 = writer.sheets['Price Comparison']
+                    from openpyxl.styles import PatternFill
+                    green = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')
+                    
+                    grp = []
+                    for ri, (_, row) in enumerate(export_cdf.iterrows(), start=2):
+                        is_blank = pd.isna(row.get('Unit Price (Final)')) and (pd.isna(row.get('SKU')) or row.get('SKU') == '')
+                        if is_blank:
+                            if grp:
+                                prices = [(r, export_cdf.iloc[r-2]['Total (Final)']) for r in grp if pd.notna(export_cdf.iloc[r-2]['Total (Final)'])]
+                                if prices:
+                                    mr = min(prices, key=lambda x: x[1])[0]
+                                    for ci in range(1, len(export_cdf.columns) + 1):
+                                        ws2.cell(row=mr, column=ci).fill = green
+                            grp = []
+                        else:
+                            grp.append(ri)
+                    if grp:
+                        prices = [(r, export_cdf.iloc[r-2]['Total (Final)']) for r in grp if pd.notna(export_cdf.iloc[r-2]['Total (Final)'])]
+                        if prices:
+                            mr = min(prices, key=lambda x: x[1])[0]
+                            for ci in range(1, len(export_cdf.columns) + 1):
+                                ws2.cell(row=mr, column=ci).fill = green
+                else:
+                    pd.DataFrame(['No comparison data']).to_excel(writer, index=False, sheet_name='Price Comparison')
+                
+                # --- Sheet 3: Best Price (grouped by supplier) ---
+                if 'summary_rows' in dir() and summary_rows:
+                    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                    bold_font = Font(bold=True)
+                    header_font = Font(bold=True, size=13, color="FFFFFF")
+                    supplier_fill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
+                    total_fill = PatternFill(start_color='E8F5E9', end_color='E8F5E9', fill_type='solid')
+                    grand_fill = PatternFill(start_color='1B5E20', end_color='1B5E20', fill_type='solid')
+                    grand_font = Font(bold=True, size=14, color="FFFFFF")
+                    thin_border = Border(
+                        bottom=Side(style='thin', color='CCCCCC')
+                    )
+                    
+                    # Build a DataFrame from summary_rows and group by supplier
+                    best_df = pd.DataFrame(summary_rows)
+                    bp_columns = ['SKU', 'Product Name', 'Quantity', 'Unit Price (Final)', 'Total (Final)']
+                    
+                    # Create the sheet
+                    # We write manually for full control over layout
+                    ws_bp = writer.book.create_sheet('Best Price')
+                    
+                    # Title row
+                    ws_bp.cell(row=1, column=1, value="BEST PRICE BREAKDOWN BY SUPPLIER")
+                    ws_bp.cell(row=1, column=1).font = Font(bold=True, size=16)
+                    ws_bp.merge_cells('A1:E1')
+                    
+                    current_row = 3
+                    overall_grand_total = 0.0
+                    supplier_totals = []  # Track for summary at end
+                    
+                    # Group by Supplier Name
+                    suppliers = best_df.groupby('Supplier Name', sort=True)
+                    
+                    for supplier_name, supplier_items in suppliers:
+                        if not supplier_name or pd.isna(supplier_name):
+                            continue
+                        
+                        # Supplier header row (colored banner)
+                        ws_bp.cell(row=current_row, column=1, value=f"📦 {supplier_name}")
+                        for col_idx in range(1, 6):
+                            ws_bp.cell(row=current_row, column=col_idx).fill = supplier_fill
+                            ws_bp.cell(row=current_row, column=col_idx).font = header_font
+                        ws_bp.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=5)
+                        current_row += 1
+                        
+                        # Column headers
+                        col_headers = ['SKU', 'Product Name', 'Qty', 'Unit Price (DOP)', 'Total (DOP)']
+                        for ci, header in enumerate(col_headers, 1):
+                            cell = ws_bp.cell(row=current_row, column=ci, value=header)
+                            cell.font = bold_font
+                            cell.border = thin_border
+                        current_row += 1
+                        
+                        # Data rows
+                        supplier_total = 0.0
+                        item_count = 0
+                        for _, item_row in supplier_items.iterrows():
+                            ws_bp.cell(row=current_row, column=1, value=item_row.get('SKU', ''))
+                            ws_bp.cell(row=current_row, column=2, value=item_row.get('Product Name', ''))
+                            ws_bp.cell(row=current_row, column=3, value=item_row.get('Quantity', 0))
+                            
+                            unit_p = item_row.get('Unit Price (Final)', 0) or 0
+                            total_p = item_row.get('Total (Final)', 0) or 0
+                            
+                            cell_up = ws_bp.cell(row=current_row, column=4, value=round(unit_p, 2))
+                            cell_up.number_format = '#,##0.00'
+                            cell_tp = ws_bp.cell(row=current_row, column=5, value=round(total_p, 2))
+                            cell_tp.number_format = '#,##0.00'
+                            
+                            for ci in range(1, 6):
+                                ws_bp.cell(row=current_row, column=ci).border = thin_border
+                            
+                            supplier_total += total_p
+                            item_count += 1
+                            current_row += 1
+                        
+                        # Supplier subtotal row
+                        ws_bp.cell(row=current_row, column=3, value=f"{item_count} items")
+                        ws_bp.cell(row=current_row, column=4, value="SUBTOTAL:")
+                        ws_bp.cell(row=current_row, column=4).font = bold_font
+                        cell_st = ws_bp.cell(row=current_row, column=5, value=round(supplier_total, 2))
+                        cell_st.font = bold_font
+                        cell_st.number_format = '#,##0.00'
+                        for ci in range(1, 6):
+                            ws_bp.cell(row=current_row, column=ci).fill = total_fill
+                        
+                        supplier_totals.append({'name': supplier_name, 'total': supplier_total, 'items': item_count})
+                        overall_grand_total += supplier_total
+                        current_row += 2  # Blank row between suppliers
+                    
+                    # --- Grand Total Section ---
+                    current_row += 1
+                    ws_bp.cell(row=current_row, column=1, value="PURCHASE SUMMARY")
+                    ws_bp.cell(row=current_row, column=1).font = Font(bold=True, size=14)
+                    ws_bp.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=5)
+                    current_row += 1
+                    
+                    # Summary table headers
+                    sum_headers = ['Supplier', '', 'Items', '', 'Total (DOP)']
+                    for ci, h in enumerate(sum_headers, 1):
+                        cell = ws_bp.cell(row=current_row, column=ci, value=h)
+                        cell.font = bold_font
+                        cell.border = thin_border
+                    current_row += 1
+                    
+                    # Summary rows per supplier
+                    for st_info in supplier_totals:
+                        ws_bp.cell(row=current_row, column=1, value=st_info['name'])
+                        ws_bp.cell(row=current_row, column=3, value=st_info['items'])
+                        cell_t = ws_bp.cell(row=current_row, column=5, value=round(st_info['total'], 2))
+                        cell_t.number_format = '#,##0.00'
+                        for ci in range(1, 6):
+                            ws_bp.cell(row=current_row, column=ci).border = thin_border
+                        current_row += 1
+                    
+                    # Grand total row
+                    total_items_count = sum(s['items'] for s in supplier_totals)
+                    ws_bp.cell(row=current_row, column=1, value="GRAND TOTAL")
+                    ws_bp.cell(row=current_row, column=3, value=total_items_count)
+                    cell_gt = ws_bp.cell(row=current_row, column=5, value=round(overall_grand_total, 2))
+                    cell_gt.number_format = '#,##0.00'
+                    for ci in range(1, 6):
+                        ws_bp.cell(row=current_row, column=ci).fill = grand_fill
+                        ws_bp.cell(row=current_row, column=ci).font = grand_font
+                    
+                    # Auto-size columns
+                    ws_bp.column_dimensions['A'].width = 18
+                    ws_bp.column_dimensions['B'].width = 45
+                    ws_bp.column_dimensions['C'].width = 12
+                    ws_bp.column_dimensions['D'].width = 18
+                    ws_bp.column_dimensions['E'].width = 18
+
+                if 'quotation_id' in df.columns:
+                    import sqlite3
+                    conn = sqlite3.connect('quotations.db')
+                    for q_id in df['quotation_id'].unique():
+                        if pd.isna(q_id): continue
+                        q_data = pd.read_sql_query("SELECT filename, currency FROM quotations WHERE id = ?", conn, params=(int(q_id),))
+                        if q_data.empty: continue
+                        fn = q_data.iloc[0]['filename']
+                        currency = q_data.iloc[0]['currency']
+                        base = os.path.splitext(fn)[0]
+                        sn = base[:30]
+                        for ch in ['[',']','*','?','/','\\',' :']:
+                            sn = sn.replace(ch, '')
+                        q_items = df[df['quotation_id'] == q_id].copy()
+                        tax_r = q_items['tax_rate'].iloc[0] if len(q_items) > 0 else 0.0
+                        disc_r = q_items['discount_rate'].iloc[0] if len(q_items) > 0 else 0.0
+                        sdf = q_items[['sku','product_name','quantity','unit_price','total_price']].copy()
+                        sdf.columns = ['SKU','Product Name','Quantity','Unit Price','Total']
+                        sdf.to_excel(writer, index=False, sheet_name=sn)
+                        wsx = writer.sheets[sn]
+                        from openpyxl.styles import Font
+                        bold = Font(bold=True)
+                        sub = sdf['Total'].sum()
+                        da = sub * (disc_r / 100.0)
+                        sad = sub - da
+                        ta = sad * (tax_r / 100.0)
+                        ft = sad + ta
+                        tr = len(sdf) + 3
+                        wsx.cell(row=tr, column=4, value="Subtotal:"); wsx.cell(row=tr, column=5, value=sub)
+                        wsx.cell(row=tr+1, column=4, value=f"Discount ({disc_r}%):"); wsx.cell(row=tr+1, column=5, value=-da)
+                        wsx.cell(row=tr+2, column=4, value="Subtotal (excl. Tax):"); wsx.cell(row=tr+2, column=5, value=sad)
+                        wsx.cell(row=tr+3, column=4, value=f"Tax ({tax_r}%):"); wsx.cell(row=tr+3, column=5, value=ta)
+                        wsx.cell(row=tr+4, column=4, value=f"FINAL TOTAL ({currency}):"); wsx.cell(row=tr+4, column=5, value=ft)
+                        wsx.cell(row=tr+4, column=4).font = Font(bold=True, size=12)
+                        wsx.cell(row=tr+4, column=5).font = Font(bold=True, size=12)
+                        if currency == 'USD':
+                            fdop = ft * exchange_rate
+                            wsx.cell(row=tr+5, column=4, value="Exchange Rate:"); wsx.cell(row=tr+5, column=5, value=exchange_rate)
+                            wsx.cell(row=tr+6, column=4, value="FINAL TOTAL (DOP):"); wsx.cell(row=tr+6, column=5, value=fdop)
+                            wsx.cell(row=tr+6, column=4).font = Font(bold=True, size=12, color="008000")
+                            wsx.cell(row=tr+6, column=5).font = Font(bold=True, size=12, color="008000")
+                    conn.close()
+            
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            st.download_button(f"📥 Download Excel ({ts})", buffer.getvalue(), f"quotation_comparison_{ts}.xlsx",
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key='download-excel')
+
 else:
-    st.info("Upload PDFs to start comparing.")
+    st.info("Upload PDFs or Excel files to start comparing.")
